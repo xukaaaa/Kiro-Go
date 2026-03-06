@@ -25,26 +25,39 @@ import (
 )
 
 func main() {
-	// 配置文件路径，支持环境变量覆盖
+	// CONFIG_URL: remote config (GitHub Gist, raw file, etc.)
+	// CONFIG_PATH: local config file path (default: data/config.json)
 	configPath := "data/config.json"
 	if envPath := os.Getenv("CONFIG_PATH"); envPath != "" {
 		configPath = envPath
 	}
 
-	// 确保数据目录存在
-	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
-		log.Fatalf("Failed to create data directory: %v", err)
-	}
+	// Initialize Gist sync (checks for GITHUB_TOKEN and GIST_ID)
+	config.SetGistConfig()
 
-	// 加载配置
-	if err := config.Init(configPath); err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+	// If Gist sync is configured, load from Gist API (handles changing commit hashes)
+	if config.IsGistConfigured() {
+		log.Printf("Loading config from Gist: %s", os.Getenv("GIST_ID"))
+		if err := config.LoadFromGistAPI(); err != nil {
+			log.Fatalf("Failed to load config from Gist: %v", err)
+		}
+	} else {
+		// Local file mode
+		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+			log.Fatalf("Failed to create data directory: %v", err)
+		}
+		if err := config.Init(configPath); err != nil {
+			log.Fatalf("Failed to load config: %v", err)
+		}
 	}
 
 	// 环境变量覆盖密码
 	if envPassword := os.Getenv("ADMIN_PASSWORD"); envPassword != "" {
 		config.SetPassword(envPassword)
 	}
+
+	// Initialize Gist sync
+	config.SetGistConfig()
 
 	// 初始化账号池
 	pool.GetPool()

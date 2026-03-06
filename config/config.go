@@ -11,11 +11,16 @@
 package config
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
 	"os"
 	"sync"
+	"time"
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -155,8 +160,6 @@ func Load() error {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Create default configuration.
-			// Binds to 0.0.0.0 by default for Docker/container compatibility.
 			cfg = &Config{
 				Password:      "changeme",
 				Port:          8080,
@@ -174,6 +177,49 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+	ScheduleGistPush()
+	return nil
+}
+
+// LoadFromURL fetches configuration from a remote URL (GitHub Gist, raw file, etc.)
+// and saves it locally for backup. This enables configuration management via
+// external services without requiring persistent disk storage.
+func LoadFromURL(url string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	// Set default path if not set
+	if cfgPath == "" {
+		cfgPath = "data/config.json"
+	}
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to fetch config from URL: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to fetch config: HTTP %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var c Config
+	if err := json.Unmarshal(data, &c); err != nil {
+		return fmt.Errorf("failed to parse config JSON: %w", err)
+	}
+
+	cfg = &c
+
+	// Save to local file as backup
+	if err := Save(); err != nil {
+		log.Printf("Warning: failed to save local config backup: %v", err)
+	}
+
 	return nil
 }
 
@@ -185,6 +231,72 @@ func Save() error {
 		return err
 	}
 	return os.WriteFile(cfgPath, data, 0600)
+}
+
+// ScheduleGistPush schedules an async push to Gist after config changes
+// This is non-blocking and safe to call from within locked contexts
+func ScheduleGistPush() {
+	if githubToken == "" || gistID == "" {
+		return
+	}
+
+	go func() {
+		// Wait a bit to allow Save() to complete
+		time.Sleep(100 * time.Millisecond)
+
+		cfgLock.RLock()
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		cfgLock.RUnlock()
+
+		if err != nil {
+			log.Printf("Gist push failed: %v", err)
+			return
+		}
+
+		if err := pushToGistInternal(string(data)); err != nil {
+			log.Printf("Gist push failed: %v", err)
+		}
+	}()
+}
+
+// pushToGistInternal pushes raw JSON to Gist without acquiring lock
+func pushToGistInternal(jsonData string) error {
+	if githubToken == "" || gistID == "" {
+		return nil
+	}
+
+	url := fmt.Sprintf("https://api.github.com/gists/%s", gistID)
+
+	payload := map[string]interface{}{
+		"description": "Kiro-Go Config",
+		"files": map[string]interface{}{
+			"config.json": map[string]string{
+				"content": jsonData,
+			},
+		},
+	}
+
+	payloadBytes, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("PATCH", url, bytes.NewReader(payloadBytes))
+	req.Header.Set("Authorization", "Bearer "+githubToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to update gist: HTTP %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("Config pushed to Gist: %s", gistID)
+	return nil
 }
 
 // SetPassword updates the admin password.
@@ -249,7 +361,11 @@ func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.Accounts = append(cfg.Accounts, account)
-	return Save()
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
 }
 
 func UpdateAccount(id string, account Account) error {
@@ -258,7 +374,11 @@ func UpdateAccount(id string, account Account) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i] = account
-			return Save()
+			if err := Save(); err != nil {
+				return err
+			}
+			ScheduleGistPush()
+			return nil
 		}
 	}
 	return nil
@@ -270,7 +390,11 @@ func DeleteAccount(id string) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts = append(cfg.Accounts[:i], cfg.Accounts[i+1:]...)
-			return Save()
+			if err := Save(); err != nil {
+				return err
+			}
+			ScheduleGistPush()
+			return nil
 		}
 	}
 	return nil
@@ -439,4 +563,150 @@ func UpdatePreferredEndpoint(endpoint string) error {
 	defer cfgLock.Unlock()
 	cfg.PreferredEndpoint = endpoint
 	return Save()
+}
+
+// ==================== Gist Sync ====================
+
+var (
+	githubToken string
+	gistID      string
+)
+
+// InitGistSync initializes GitHub Gist sync with token and Gist ID
+func InitGistSync(token, id string) {
+	githubToken = token
+	gistID = id
+}
+
+// PushToGist pushes current config to GitHub Gist
+// Returns nil if successful, error if Gist sync is not configured or fails
+func PushToGist() error {
+	if githubToken == "" || gistID == "" {
+		return nil // Silently skip if not configured
+	}
+
+	cfgLock.RLock()
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	cfgLock.RUnlock()
+
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	// GitHub Gist API to update existing gist
+	url := fmt.Sprintf("https://api.github.com/gists/%s", gistID)
+
+	payload := map[string]interface{}{
+		"description": "Kiro-Go Config",
+		"files": map[string]interface{}{
+			"config.json": string(data),
+		},
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequest("PATCH", url, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+githubToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to update gist: HTTP %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("Config pushed to Gist: %s", gistID)
+	return nil
+}
+
+// SetGistConfig sets Gist configuration from environment variables
+func SetGistConfig() {
+	githubToken = os.Getenv("GITHUB_TOKEN")
+	gistID = os.Getenv("GIST_ID")
+
+	if githubToken != "" && gistID != "" {
+		log.Printf("Gist sync enabled for: %s", gistID)
+	}
+}
+
+// IsGistConfigured returns true if both GITHUB_TOKEN and GIST_ID are set
+func IsGistConfigured() bool {
+	return githubToken != "" && gistID != ""
+}
+
+// LoadFromGistAPI fetches config from GitHub Gist API
+// This handles the changing commit hash issue in raw URLs
+func LoadFromGistAPI() error {
+	if githubToken == "" || gistID == "" {
+		return fmt.Errorf("Gist not configured")
+	}
+
+	url := fmt.Sprintf("https://api.github.com/gists/%s", gistID)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+githubToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch gist: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to fetch gist: HTTP %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse Gist API response
+	var gistResp struct {
+		Files map[string]struct {
+			Content string `json:"content"`
+		} `json:"files"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&gistResp); err != nil {
+		return fmt.Errorf("failed to decode gist response: %w", err)
+	}
+
+	file, ok := gistResp.Files["config.json"]
+	if !ok {
+		return fmt.Errorf("config.json not found in gist")
+	}
+
+	var c Config
+	if err := json.Unmarshal([]byte(file.Content), &c); err != nil {
+		return fmt.Errorf("failed to parse config JSON: %w", err)
+	}
+
+	cfgLock.Lock()
+	cfg = &c
+	cfgLock.Unlock()
+
+	// Save to local file as backup
+	cfgPath = "data/config.json"
+	if err := Save(); err != nil {
+		log.Printf("Warning: failed to save local config backup: %v", err)
+	}
+
+	return nil
 }

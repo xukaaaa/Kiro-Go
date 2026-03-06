@@ -9,4 +9,6 @@ services:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GIST_ID=${GIST_ID}
     restart: unless-stopped
