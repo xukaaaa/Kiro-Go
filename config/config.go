@@ -123,7 +123,7 @@ type Config struct {
 	Fireworks *FireworksConfig `json:"fireworks,omitempty"` // Fireworks AI provider config
 
 	// Model mapping configuration
-	ModelMappings []ModelMapping `json:"modelMappings,omitempty"` // Model name mappings
+	ModelMappings []ModelMapping `json:"modelMappings"` // Model name mappings
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
