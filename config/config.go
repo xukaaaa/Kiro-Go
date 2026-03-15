@@ -279,7 +279,13 @@ func LoadFromURL(url string) error {
 
 	cfg = &c
 
-	// Save to local file as backup
+	// Seed default model mappings if empty
+	if len(cfg.ModelMappings) == 0 {
+		cfg.ModelMappings = getDefaultModelMappings()
+		log.Println("Seeding default model mappings...")
+	}
+
+	// Save to local file as backup (and persist defaults if seeded)
 	if err := Save(); err != nil {
 		log.Printf("Warning: failed to save local config backup: %v", err)
 	}
