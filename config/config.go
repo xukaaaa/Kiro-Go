@@ -457,7 +457,11 @@ func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits 
 	cfg.FailedRequests = failedReq
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
-	return Save()
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
 }
 
 func GetStats() (int, int, int, int, float64) {
