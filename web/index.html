@@ -120,6 +120,12 @@
             background: #6d28d9;
         }
 
+        .btn-primary:disabled {
+            background: #94a3b8;
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
         .btn-danger {
             background: #ef4444;
             color: white;
@@ -913,6 +919,7 @@
         </div>
         <div class="tabs">
             <div class="tab active" data-tab="accounts" data-i18n="tabs.accounts"></div>
+            <div class="tab" data-tab="mappings" data-i18n="tabs.mappings"></div>
             <div class="tab" data-tab="settings" data-i18n="tabs.settings"></div>
             <div class="tab" data-tab="api" data-i18n="tabs.api"></div>
         </div>
@@ -953,6 +960,14 @@
                     </div>
                 </div>
                 <div id="accountsList"></div>
+            </div>
+        </div>
+        <div id="tabMappings" class="tab-content hidden">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title" data-i18n="mappings.title"></span>
+                </div>
+                <div id="mappingsList"></div>
             </div>
         </div>
         <div id="tabSettings" class="tab-content hidden">
@@ -1102,6 +1117,7 @@
                 'stats.success': '成功',
                 'stats.failed': '失败',
                 'tabs.accounts': '账号',
+                'tabs.mappings': '模型映射',
                 'tabs.settings': '设置',
                 'tabs.api': 'API',
                 'accounts.title': '账号列表',
@@ -1133,6 +1149,18 @@
                 'accounts.copyJSON': '复制 JSON',
                 'accounts.copyJSONSuccess': 'JSON 已复制到剪贴板',
                 'accounts.trialDays': '天后到期',
+                'mappings.title': '模型映射',
+                'mappings.add': '添加映射',
+                'mappings.edit': '编辑',
+                'mappings.delete': '删除',
+                'mappings.sourceModel': '源模型',
+                'mappings.targetModel': '目标模型',
+                'mappings.enabled': '启用',
+                'mappings.disabled': '禁用',
+                'mappings.description': '描述',
+                'mappings.empty': '暂无映射',
+                'mappings.confirmDelete': '确定删除此映射？',
+                'mappings.passthrough': '保持原样',
                 'time.expired': '已过期',
                 'time.minutes': '分钟',
                 'time.hours': '小时',
@@ -1318,6 +1346,7 @@
                 'stats.success': 'Success',
                 'stats.failed': 'Failed',
                 'tabs.accounts': 'Accounts',
+                'tabs.mappings': 'Model Mappings',
                 'tabs.settings': 'Settings',
                 'tabs.api': 'API',
                 'accounts.title': 'Account List',
@@ -1343,6 +1372,18 @@
                 'accounts.confirmDelete': 'Confirm delete?',
                 'accounts.copyJSON': 'Copy JSON',
                 'accounts.copyJSONSuccess': 'JSON copied to clipboard',
+                'mappings.title': 'Model Mappings',
+                'mappings.add': 'Add Mapping',
+                'mappings.edit': 'Edit',
+                'mappings.delete': 'Delete',
+                'mappings.sourceModel': 'Source Model',
+                'mappings.targetModel': 'Target Model',
+                'mappings.enabled': 'Enabled',
+                'mappings.disabled': 'Disabled',
+                'mappings.description': 'Description',
+                'mappings.empty': 'No mappings',
+                'mappings.confirmDelete': 'Confirm delete this mapping?',
+                'mappings.passthrough': 'Pass-through',
                 'time.expired': 'Expired',
                 'time.minutes': 'min',
                 'time.hours': 'hr',
@@ -1662,7 +1703,7 @@
             document.getElementById('mainPage').classList.remove('hidden');
         }
         async function loadData() {
-            await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
+            await Promise.all([loadStats(), loadAccounts(), loadMappings(), loadSettings(), loadVersion()]);
             document.getElementById('claudeEndpoint').textContent = baseUrl + '/v1/messages';
             document.getElementById('openaiEndpoint').textContent = baseUrl + '/v1/chat/completions';
             document.getElementById('modelsEndpoint').textContent = baseUrl + '/v1/models';
@@ -2572,6 +2613,145 @@
                 });
             } catch (e) { }
             loadAccounts();
+        }
+
+        // ==================== Model Mappings ====================
+        let mappingsData = [];
+        let availableModels = [];
+
+        async function loadAvailableModels() {
+            try {
+                const res = await fetch('/models', {
+                    headers: { 'X-Admin-Password': password }
+                });
+                const data = await res.json();
+                const allModels = data.data ? data.data.map(m => m.id) : [];
+
+                // Filter out full Fireworks paths (accounts/fireworks/models/*)
+                // Keep short aliases that translator.go will expand
+                availableModels = allModels.filter(m => !m.startsWith('accounts/fireworks/models/'));
+            } catch (e) {
+                console.error('Failed to load models:', e);
+                availableModels = [];
+            }
+        }
+
+        async function loadMappings() {
+            await loadAvailableModels();
+            const res = await fetch('/admin/api/model-mappings', { headers: { 'X-Admin-Password': password } });
+            mappingsData = await res.json();
+            renderMappings();
+        }
+
+        function renderMappings() {
+            const list = document.getElementById('mappingsList');
+            if (!mappingsData || mappingsData.length === 0) {
+                list.innerHTML = '<div style="padding:40px;text-align:center;color:#94a3b8" data-i18n="mappings.empty"></div>';
+                applyTranslations();
+                return;
+            }
+
+            const defaultMappings = mappingsData.slice(0, 3);
+            const modelOptions = availableModels.map(model =>
+                `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`
+            ).join('');
+
+            list.innerHTML = `
+                <div style="padding:20px">
+                    ${defaultMappings.map((m, idx) => `
+                        <div style="display:grid;grid-template-columns:1fr 1fr 2fr auto;gap:12px;align-items:center;padding:16px 0;border-bottom:1px solid #e2e8f0">
+                            <div>
+                                <label style="font-size:12px;color:#64748b;display:block;margin-bottom:4px" data-i18n="mappings.sourceModel"></label>
+                                <input type="text" value="${escapeHtml(m.sourceModel)}" readonly style="background:#f1f5f9;cursor:not-allowed;width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:4px">
+                            </div>
+                            <div>
+                                <label style="font-size:12px;color:#64748b;display:block;margin-bottom:4px" data-i18n="mappings.targetModel"></label>
+                                <select id="targetModel_${idx}" data-mapping-id="${m.id}" onchange="onMappingChange()" style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:4px">
+                                    <option value="">Keep original</option>
+                                    ${modelOptions}
+                                </select>
+                            </div>
+                            <div>
+                                <label style="font-size:12px;color:#64748b;display:block;margin-bottom:4px" data-i18n="mappings.description"></label>
+                                <input type="text" id="description_${idx}" value="${escapeHtml(m.description || '')}" onchange="onMappingChange()" style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:4px">
+                            </div>
+                            <div style="display:flex;align-items:center;gap:8px;padding-top:20px">
+                                <label class="switch" style="margin:0">
+                                    <input type="checkbox" id="enabled_${idx}" ${m.enabled ? 'checked' : ''} onchange="onMappingChange()">
+                                    <span class="slider"></span>
+                                </label>
+                                <span style="font-size:12px;color:#64748b" data-i18n="mappings.enabled"></span>
+                            </div>
+                        </div>
+                    `).join('')}
+                    <div style="padding-top:20px;display:flex;justify-content:flex-end">
+                        <button id="saveMappingsBtn" class="btn btn-primary" onclick="saveMappings()" disabled data-i18n="common.save"></button>
+                    </div>
+                </div>
+            `;
+
+            // Set selected values for dropdowns
+            defaultMappings.forEach((m, idx) => {
+                const select = document.getElementById(`targetModel_${idx}`);
+                if (select && m.targetModel) {
+                    select.value = m.targetModel;
+                }
+            });
+
+            applyTranslations();
+        }
+
+        function onMappingChange() {
+            const saveBtn = document.getElementById('saveMappingsBtn');
+            if (saveBtn) {
+                saveBtn.disabled = false;
+            }
+        }
+
+        async function saveMappings() {
+            const defaultMappings = mappingsData.slice(0, 3);
+            const saveBtn = document.getElementById('saveMappingsBtn');
+
+            try {
+                saveBtn.disabled = true;
+                const originalText = saveBtn.textContent;
+                saveBtn.textContent = 'Saving...';
+
+                for (let i = 0; i < defaultMappings.length; i++) {
+                    const mapping = defaultMappings[i];
+                    const targetModel = document.getElementById(`targetModel_${i}`).value;
+                    const description = document.getElementById(`description_${i}`).value.trim();
+                    const enabled = document.getElementById(`enabled_${i}`).checked;
+
+                    const data = {
+                        sourceModel: mapping.sourceModel,
+                        targetModel: targetModel || '',
+                        description,
+                        enabled
+                    };
+
+                    const res = await fetch(`/admin/api/model-mappings/${mapping.id}`, {
+                        method: 'PUT',
+                        headers: {
+                            'X-Admin-Password': password,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(data)
+                    });
+
+                    if (!res.ok) {
+                        const err = await res.json();
+                        throw new Error(err.error || 'Failed to save mapping');
+                    }
+                }
+
+                await loadMappings();
+                saveBtn.textContent = originalText;
+            } catch (e) {
+                alert('Error: ' + e.message);
+                saveBtn.disabled = false;
+                saveBtn.textContent = t('common.save');
+            }
         }
     </script>
 </body>

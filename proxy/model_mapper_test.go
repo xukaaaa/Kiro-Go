@@ -1,8 +1,20 @@
 package proxy
 
-import "testing"
+import (
+	"os"
+	"testing"
+
+	"kiro-api-proxy/config"
+)
 
 func TestMapModelWithCustomMapping(t *testing.T) {
+	// Setup: Initialize config with test data
+	tmpFile := "test_config.json"
+	defer os.Remove(tmpFile)
+
+	if err := config.Init(tmpFile); err != nil {
+		t.Fatalf("Failed to init config: %v", err)
+	}
 	tests := []struct {
 		name           string
 		requestedModel string
@@ -61,6 +73,9 @@ func TestMapModelWithCustomMapping(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Clear cache before each test to ensure isolation
+			InvalidateMappingCache()
+
 			gotModel, gotRemap := MapModelWithCustomMapping(tt.requestedModel)
 
 			if gotModel != tt.expectedModel {

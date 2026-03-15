@@ -38,6 +38,10 @@ var modelMapOrdered = []modelMapping{
 	{"gpt-4o", "claude-sonnet-4.5"},
 	{"gpt-4", "claude-sonnet-4.5"},
 	{"gpt-3.5-turbo", "claude-sonnet-4.5"},
+	// Fireworks aliases
+	{"glm-5", "accounts/fireworks/models/glm-5"},
+	{"kimi-k2p5", "accounts/fireworks/models/kimi-k2p5"},
+	{"minimax-m2p5", "accounts/fireworks/models/minimax-m2p5"},
 }
 
 // Thinking 模式提示

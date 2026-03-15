@@ -98,6 +98,17 @@ type FireworksConfig struct {
 	BaseURL string `json:"baseUrl,omitempty"` // Fireworks API base URL
 }
 
+// ModelMapping represents a model name mapping configuration.
+type ModelMapping struct {
+	ID          string `json:"id"`                    // Unique identifier (UUID)
+	SourceModel string `json:"sourceModel"`           // Requested model name
+	TargetModel string `json:"targetModel,omitempty"` // Mapped model name (empty = pass-through)
+	Enabled     bool   `json:"enabled"`               // Whether mapping is active
+	Description string `json:"description,omitempty"` // Optional description
+	CreatedAt   int64  `json:"createdAt,omitempty"`   // Creation timestamp
+	UpdatedAt   int64  `json:"updatedAt,omitempty"`   // Last update timestamp
+}
+
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
@@ -110,6 +121,9 @@ type Config struct {
 
 	// Provider configurations
 	Fireworks *FireworksConfig `json:"fireworks,omitempty"` // Fireworks AI provider config
+
+	// Model mapping configuration
+	ModelMappings []ModelMapping `json:"modelMappings,omitempty"` // Model name mappings
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -170,12 +184,42 @@ func Load() error {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			now := time.Now().Unix()
 			cfg = &Config{
 				Password:      "changeme",
 				Port:          8080,
 				Host:          "0.0.0.0",
 				RequireApiKey: false,
 				Accounts:      []Account{},
+				ModelMappings: []ModelMapping{
+					{
+						ID:          GenerateMachineId(),
+						SourceModel: "claude-opus-4-6",
+						TargetModel: "claude-sonnet-4.5-thinking",
+						Enabled:     true,
+						Description: "Default mapping for Opus 4.6",
+						CreatedAt:   now,
+						UpdatedAt:   now,
+					},
+					{
+						ID:          GenerateMachineId(),
+						SourceModel: "claude-sonnet-4-6",
+						TargetModel: "claude-sonnet-4.5",
+						Enabled:     true,
+						Description: "Default mapping for Sonnet 4.6",
+						CreatedAt:   now,
+						UpdatedAt:   now,
+					},
+					{
+						ID:          GenerateMachineId(),
+						SourceModel: "claude-haiku-4-5-20251001",
+						TargetModel: "claude-sonnet-4.5",
+						Enabled:     true,
+						Description: "Default mapping for Haiku 4.5",
+						CreatedAt:   now,
+						UpdatedAt:   now,
+					},
+				},
 			}
 			return Save()
 		}
@@ -187,6 +231,16 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+
+	// Seed default model mappings if empty
+	if len(cfg.ModelMappings) == 0 {
+		cfg.ModelMappings = getDefaultModelMappings()
+		if err := Save(); err != nil {
+			log.Printf("Warning: Failed to save default model mappings: %v", err)
+			// Continue anyway - mappings are in memory and will work for this session
+		}
+	}
+
 	ScheduleGistPush()
 	return nil
 }
@@ -757,4 +811,124 @@ func UpdateFireworksConfig(enabled bool, apiKey, baseURL string) error {
 		cfg.Fireworks.BaseURL = "https://api.fireworks.ai/inference/v1"
 	}
 	return Save()
+}
+
+// getDefaultModelMappings returns the default model mappings to seed on first load
+func getDefaultModelMappings() []ModelMapping {
+	now := time.Now().Unix()
+	return []ModelMapping{
+		{
+			ID:          GenerateMachineId(),
+			SourceModel: "claude-opus-4-6",
+			TargetModel: "claude-sonnet-4.5-thinking",
+			Enabled:     true,
+			Description: "Default mapping for Opus 4.6",
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		{
+			ID:          GenerateMachineId(),
+			SourceModel: "claude-sonnet-4-6",
+			TargetModel: "claude-sonnet-4.5",
+			Enabled:     true,
+			Description: "Default mapping for Sonnet 4.6",
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		{
+			ID:          GenerateMachineId(),
+			SourceModel: "claude-haiku-4-5-20251001",
+			TargetModel: "claude-sonnet-4.5",
+			Enabled:     true,
+			Description: "Default mapping for Haiku 4.5",
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+	}
+}
+
+// GetModelMappings returns all model mappings (returns a copy to prevent external modification)
+func GetModelMappings() []ModelMapping {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	mappings := make([]ModelMapping, len(cfg.ModelMappings))
+	copy(mappings, cfg.ModelMappings)
+	return mappings
+}
+
+// GetEnabledModelMappings returns only enabled mappings
+func GetEnabledModelMappings() []ModelMapping {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	var enabled []ModelMapping
+	for _, m := range cfg.ModelMappings {
+		if m.Enabled {
+			enabled = append(enabled, m)
+		}
+	}
+	return enabled
+}
+
+// AddModelMapping adds a new model mapping
+func AddModelMapping(mapping ModelMapping) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	// Generate ID if not provided
+	if mapping.ID == "" {
+		mapping.ID = GenerateMachineId()
+	}
+
+	// Set timestamps
+	now := time.Now().Unix()
+	mapping.CreatedAt = now
+	mapping.UpdatedAt = now
+
+	cfg.ModelMappings = append(cfg.ModelMappings, mapping)
+	return Save()
+}
+
+// UpdateModelMapping updates an existing mapping by ID
+func UpdateModelMapping(id string, mapping ModelMapping) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	for i, m := range cfg.ModelMappings {
+		if m.ID == id {
+			// Preserve original timestamps
+			mapping.ID = id
+			mapping.CreatedAt = m.CreatedAt
+			mapping.UpdatedAt = time.Now().Unix()
+			cfg.ModelMappings[i] = mapping
+			return Save()
+		}
+	}
+	return fmt.Errorf("model mapping not found: %s", id)
+}
+
+// DeleteModelMapping removes a mapping by ID
+func DeleteModelMapping(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	for i, m := range cfg.ModelMappings {
+		if m.ID == id {
+			cfg.ModelMappings = append(cfg.ModelMappings[:i], cfg.ModelMappings[i+1:]...)
+			return Save()
+		}
+	}
+	return fmt.Errorf("model mapping not found: %s", id)
+}
+
+// GetModelMappingByID retrieves a specific mapping
+func GetModelMappingByID(id string) (*ModelMapping, error) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+
+	for _, m := range cfg.ModelMappings {
+		if m.ID == id {
+			return &m, nil
+		}
+	}
+	return nil, fmt.Errorf("model mapping not found: %s", id)
 }

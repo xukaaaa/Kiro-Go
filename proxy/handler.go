@@ -3,11 +3,13 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"kiro-api-proxy/auth"
 	"kiro-api-proxy/config"
 	"kiro-api-proxy/pool"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +17,9 @@ import (
 
 	"github.com/google/uuid"
 )
+
+// Model name validation regex: alphanumeric, dots, dashes, underscores, slashes (for Fireworks paths)
+var modelNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._/-]{1,100}$`)
 
 // Handler HTTP 处理器
 type Handler struct {
@@ -262,9 +267,44 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// getAllAvailableModels returns all available model IDs (without metadata)
+func (h *Handler) getAllAvailableModels() []string {
+	h.modelsCacheMu.RLock()
+	cached := h.cachedModels
+	h.modelsCacheMu.RUnlock()
+
+	thinkingSuffix := config.GetThinkingConfig().Suffix
+	modelIDs := make([]string, 0)
+
+	// Kiro models (cached or fallback)
+	if len(cached) > 0 {
+		for _, m := range cached {
+			modelIDs = append(modelIDs, m.ModelId)
+			modelIDs = append(modelIDs, m.ModelId+thinkingSuffix)
+		}
+	} else {
+		// fallback static list
+		baseModels := []string{
+			"claude-sonnet-4.6", "claude-opus-4.6", "claude-sonnet-4.5",
+			"claude-sonnet-4", "claude-haiku-4.5", "claude-opus-4.5",
+		}
+		for _, m := range baseModels {
+			modelIDs = append(modelIDs, m)
+			modelIDs = append(modelIDs, m+thinkingSuffix)
+		}
+	}
+
+	// Kiro aliases
+	modelIDs = append(modelIDs, "auto", "gpt-4o", "gpt-4")
+
+	// Fireworks models (TODO: fetch dynamically)
+	modelIDs = append(modelIDs, "glm-5", "kimi-k2p5", "minimax-m2p5")
+
+	return modelIDs
+}
+
 // handleModels 模型列表
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
-	// 尝试用缓存的真实模型列表
 	h.modelsCacheMu.RLock()
 	cached := h.cachedModels
 	h.modelsCacheMu.RUnlock()
@@ -276,7 +316,6 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		for _, m := range cached {
 			supportsImage := modelSupportsImage(m.InputTypes)
 			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			// 自动生成 thinking 变体
 			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
 		}
 	} else {
@@ -301,6 +340,15 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("auto", "kiro-proxy", true),
 		buildModelInfo("gpt-4o", "kiro-proxy", true),
 		buildModelInfo("gpt-4", "kiro-proxy", true),
+	)
+
+	// TODO: Fetch Fireworks models dynamically from API (similar to Kiro pattern)
+	// For now, hardcode 3 models as temporary solution
+	// Future: fetchFireworksModels() -> cache -> fallback static list
+	models = append(models,
+		buildModelInfo("glm-5", "fireworks", true),
+		buildModelInfo("kimi-k2p5", "fireworks", true),
+		buildModelInfo("minimax-m2p5", "fireworks", true),
 	)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1669,6 +1717,16 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetFireworksConfig(w, r)
 	case path == "/fireworks" && r.Method == "POST":
 		h.apiUpdateFireworksConfig(w, r)
+	case path == "/model-mappings" && r.Method == "GET":
+		h.apiGetModelMappings(w, r)
+	case path == "/model-mappings" && r.Method == "POST":
+		h.apiAddModelMapping(w, r)
+	case strings.HasPrefix(path, "/model-mappings/") && r.Method == "GET":
+		h.apiGetModelMapping(w, r, strings.TrimPrefix(path, "/model-mappings/"))
+	case strings.HasPrefix(path, "/model-mappings/") && r.Method == "PUT":
+		h.apiUpdateModelMapping(w, r, strings.TrimPrefix(path, "/model-mappings/"))
+	case strings.HasPrefix(path, "/model-mappings/") && r.Method == "DELETE":
+		h.apiDeleteModelMapping(w, r, strings.TrimPrefix(path, "/model-mappings/"))
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -2821,4 +2879,192 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(data)
+}
+
+// Model Mapping API handlers
+
+func (h *Handler) apiGetModelMappings(w http.ResponseWriter, r *http.Request) {
+	mappings := config.GetModelMappings()
+	json.NewEncoder(w).Encode(mappings)
+}
+
+func (h *Handler) apiGetModelMapping(w http.ResponseWriter, r *http.Request, id string) {
+	mapping, err := config.GetModelMappingByID(id)
+	if err != nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(mapping)
+}
+
+func (h *Handler) apiAddModelMapping(w http.ResponseWriter, r *http.Request) {
+	var mapping config.ModelMapping
+	if err := json.NewDecoder(r.Body).Decode(&mapping); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// Validation
+	if mapping.SourceModel == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sourceModel is required"})
+		return
+	}
+
+	// Validate sourceModel format
+	if !modelNameRegex.MatchString(mapping.SourceModel) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid sourceModel format (alphanumeric, dots, dashes, underscores, slashes only, max 100 chars)"})
+		return
+	}
+
+	// Validate targetModel format if provided
+	if mapping.TargetModel != "" && !modelNameRegex.MatchString(mapping.TargetModel) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid targetModel format (alphanumeric, dots, dashes, underscores, slashes only, max 100 chars)"})
+		return
+	}
+
+	// Validate description length (max 500 chars)
+	if len(mapping.Description) > 500 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Description must be 500 characters or less"})
+		return
+	}
+
+	// Sanitize description to prevent XSS
+	mapping.Description = html.EscapeString(strings.TrimSpace(mapping.Description))
+
+	// Check duplicate source model
+	existingMappings := config.GetModelMappings()
+	for _, m := range existingMappings {
+		if strings.EqualFold(m.SourceModel, mapping.SourceModel) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Source model already exists"})
+			return
+		}
+	}
+
+	// Check source != target
+	if mapping.TargetModel != "" && strings.EqualFold(mapping.SourceModel, mapping.TargetModel) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Source and target models cannot be the same"})
+		return
+	}
+
+	// Validate target model exists in /models if not empty
+	if mapping.TargetModel != "" {
+		if !h.isValidModel(mapping.TargetModel) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Target model not found in available models"})
+			return
+		}
+	}
+
+	if err := config.AddModelMapping(mapping); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	InvalidateMappingCache()
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (h *Handler) apiUpdateModelMapping(w http.ResponseWriter, r *http.Request, id string) {
+	var mapping config.ModelMapping
+	if err := json.NewDecoder(r.Body).Decode(&mapping); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// Validation
+	if mapping.SourceModel == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sourceModel is required"})
+		return
+	}
+
+	// Validate sourceModel format
+	if !modelNameRegex.MatchString(mapping.SourceModel) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid sourceModel format (alphanumeric, dots, dashes, underscores, slashes only, max 100 chars)"})
+		return
+	}
+
+	// Validate targetModel format if provided
+	if mapping.TargetModel != "" && !modelNameRegex.MatchString(mapping.TargetModel) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid targetModel format (alphanumeric, dots, dashes, underscores, slashes only, max 100 chars)"})
+		return
+	}
+
+	// Validate description length (max 500 chars)
+	if len(mapping.Description) > 500 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Description must be 500 characters or less"})
+		return
+	}
+
+	// Sanitize description to prevent XSS
+	mapping.Description = html.EscapeString(strings.TrimSpace(mapping.Description))
+
+	// Check duplicate source model (excluding current mapping)
+	existingMappings := config.GetModelMappings()
+	for _, m := range existingMappings {
+		if m.ID != id && strings.EqualFold(m.SourceModel, mapping.SourceModel) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Source model already exists"})
+			return
+		}
+	}
+
+	// Check source != target
+	if mapping.TargetModel != "" && strings.EqualFold(mapping.SourceModel, mapping.TargetModel) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Source and target models cannot be the same"})
+		return
+	}
+
+	// Validate target model exists in /models if not empty
+	if mapping.TargetModel != "" {
+		if !h.isValidModel(mapping.TargetModel) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Target model not found in available models"})
+			return
+		}
+	}
+
+	if err := config.UpdateModelMapping(id, mapping); err != nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	InvalidateMappingCache()
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (h *Handler) apiDeleteModelMapping(w http.ResponseWriter, r *http.Request, id string) {
+	if err := config.DeleteModelMapping(id); err != nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	InvalidateMappingCache()
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// isValidModel checks if a model exists in the available models list
+func (h *Handler) isValidModel(modelID string) bool {
+	availableModels := h.getAllAvailableModels()
+	for _, m := range availableModels {
+		if m == modelID {
+			return true
+		}
+	}
+	return false
 }
