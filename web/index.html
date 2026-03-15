@@ -1012,6 +1012,24 @@
                     data-i18n="settings.saveEndpoint"></button>
             </div>
             <div class="card">
+                <div class="card-header"><span class="card-title" data-i18n="settings.fireworksSettings"></span></div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:10px">
+                        <label class="switch"><input type="checkbox" id="fireworksEnabled"><span class="slider"></span></label>
+                        <span data-i18n="settings.enableFireworks"></span>
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label>Fireworks API Key</label>
+                    <input type="text" id="fireworksApiKey" placeholder="fw_xxxxx">
+                </div>
+                <div class="form-group">
+                    <label>Fireworks Base URL</label>
+                    <input type="text" id="fireworksBaseUrl" placeholder="https://api.fireworks.ai/inference/v1">
+                </div>
+                <button class="btn btn-primary" onclick="saveFireworksConfig()" data-i18n="settings.saveFireworks"></button>
+            </div>
+            <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.adminPassword"></span></div>
                 <div class="form-group"><label data-i18n="settings.newPassword"></label><input type="password"
                         id="newPassword" data-i18n-placeholder="settings.newPasswordPlaceholder"></div>
@@ -1131,6 +1149,10 @@
                 'settings.noTag': '直接输出 (无标签)',
                 'settings.saveThinking': '保存 Thinking 设置',
                 'settings.thinkingSaved': 'Thinking 设置已保存',
+                'settings.fireworksSettings': 'Fireworks AI 设置',
+                'settings.enableFireworks': '启用 Fireworks 提供商',
+                'settings.saveFireworks': '保存 Fireworks 设置',
+                'settings.fireworksSaved': 'Fireworks 设置已保存',
                 'settings.endpointSettings': 'Kiro 端点设置',
                 'settings.preferredEndpoint': '首选端点',
                 'settings.endpointAuto': '自动选择',
@@ -1337,6 +1359,10 @@
                 'settings.noTag': 'Direct output (no tag)',
                 'settings.saveThinking': 'Save Thinking Settings',
                 'settings.thinkingSaved': 'Thinking settings saved',
+                'settings.fireworksSettings': 'Fireworks AI Settings',
+                'settings.enableFireworks': 'Enable Fireworks Provider',
+                'settings.saveFireworks': 'Save Fireworks Settings',
+                'settings.fireworksSaved': 'Fireworks settings saved',
                 'settings.endpointSettings': 'Kiro Endpoint Settings',
                 'settings.preferredEndpoint': 'Preferred Endpoint',
                 'settings.endpointAuto': 'Auto',
@@ -1991,6 +2017,7 @@
             document.getElementById('apiKeyInput').value = d.apiKey || '';
             loadThinkingConfig();
             loadEndpointConfig();
+            loadFireworksConfig();
         }
         async function loadThinkingConfig() {
             const res = await fetch('/admin/api/thinking', { headers: { 'X-Admin-Password': password } });
@@ -2019,6 +2046,25 @@
             });
             const d = await res.json();
             if (d.success) { alert(t('settings.endpointSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
+        }
+        async function loadFireworksConfig() {
+            const res = await fetch('/admin/api/fireworks', { headers: { 'X-Admin-Password': password } });
+            const d = await res.json();
+            document.getElementById('fireworksEnabled').checked = d.enabled || false;
+            document.getElementById('fireworksApiKey').value = d.apiKey || '';
+            document.getElementById('fireworksBaseUrl').value = d.baseUrl || 'https://api.fireworks.ai/inference/v1';
+        }
+        async function saveFireworksConfig() {
+            const res = await fetch('/admin/api/fireworks', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({
+                    enabled: document.getElementById('fireworksEnabled').checked,
+                    apiKey: document.getElementById('fireworksApiKey').value,
+                    baseUrl: document.getElementById('fireworksBaseUrl').value
+                })
+            });
+            const d = await res.json();
+            if (d.success) { alert(t('settings.fireworksSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
         }
         function generateApiKey() {
             const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
