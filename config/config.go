@@ -91,6 +91,13 @@ type Account struct {
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
 }
 
+// FireworksConfig represents Fireworks AI provider configuration.
+type FireworksConfig struct {
+	Enabled bool   `json:"enabled"`           // Whether Fireworks provider is enabled
+	ApiKey  string `json:"apiKey,omitempty"`  // Fireworks API key
+	BaseURL string `json:"baseUrl,omitempty"` // Fireworks API base URL
+}
+
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
@@ -100,6 +107,9 @@ type Config struct {
 	ApiKey        string    `json:"apiKey,omitempty"` // API key for client authentication
 	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
 	Accounts      []Account `json:"accounts"`         // Registered Kiro accounts
+
+	// Provider configurations
+	Fireworks *FireworksConfig `json:"fireworks,omitempty"` // Fireworks AI provider config
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -447,7 +457,11 @@ func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits 
 	cfg.FailedRequests = failedReq
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
-	return Save()
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
 }
 
 func GetStats() (int, int, int, int, float64) {
@@ -709,4 +723,38 @@ func LoadFromGistAPI() error {
 	}
 
 	return nil
+}
+
+// GetFireworksConfig returns Fireworks configuration with defaults
+func GetFireworksConfig() FireworksConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.Fireworks == nil {
+		return FireworksConfig{
+			Enabled: false,
+			BaseURL: "https://api.fireworks.ai/inference/v1",
+		}
+	}
+	result := *cfg.Fireworks
+	if result.BaseURL == "" {
+		result.BaseURL = "https://api.fireworks.ai/inference/v1"
+	}
+	return result
+}
+
+// UpdateFireworksConfig updates Fireworks configuration
+func UpdateFireworksConfig(enabled bool, apiKey, baseURL string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.Fireworks == nil {
+		cfg.Fireworks = &FireworksConfig{}
+	}
+	cfg.Fireworks.Enabled = enabled
+	cfg.Fireworks.ApiKey = apiKey
+	if baseURL != "" {
+		cfg.Fireworks.BaseURL = baseURL
+	} else {
+		cfg.Fireworks.BaseURL = "https://api.fireworks.ai/inference/v1"
+	}
+	return Save()
 }
