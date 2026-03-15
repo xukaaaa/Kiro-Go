@@ -307,24 +307,31 @@ func Save() error {
 // This is non-blocking and safe to call from within locked contexts
 func ScheduleGistPush() {
 	if githubToken == "" || gistID == "" {
+		log.Println("[ScheduleGistPush] Skipped: GitHub token or Gist ID not configured")
 		return
 	}
+
+	log.Printf("[ScheduleGistPush] Scheduling push to Gist: %s", gistID)
 
 	go func() {
 		// Wait a bit to allow Save() to complete
 		time.Sleep(100 * time.Millisecond)
 
 		cfgLock.RLock()
+		mappingsCount := len(cfg.ModelMappings)
 		data, err := json.MarshalIndent(cfg, "", "  ")
 		cfgLock.RUnlock()
 
 		if err != nil {
-			log.Printf("Gist push failed: %v", err)
+			log.Printf("[ScheduleGistPush] ERROR: Failed to marshal config: %v", err)
 			return
 		}
 
+		log.Printf("[ScheduleGistPush] Pushing config with %d model mappings to Gist...", mappingsCount)
 		if err := pushToGistInternal(string(data)); err != nil {
-			log.Printf("Gist push failed: %v", err)
+			log.Printf("[ScheduleGistPush] ERROR: Push failed: %v", err)
+		} else {
+			log.Printf("[ScheduleGistPush] Successfully pushed config to Gist")
 		}
 	}()
 }
@@ -772,15 +779,32 @@ func LoadFromGistAPI() error {
 		return fmt.Errorf("failed to parse config JSON: %w", err)
 	}
 
+	log.Printf("[LoadFromGistAPI] Parsed config from Gist, ModelMappings count: %d", len(c.ModelMappings))
+
 	cfgLock.Lock()
 	cfg = &c
 	cfgLock.Unlock()
 
-	// Save to local file as backup
-	cfgPath = "data/config.json"
-	if err := Save(); err != nil {
-		log.Printf("Warning: failed to save local config backup: %v", err)
+	// Seed default model mappings if empty
+	if len(cfg.ModelMappings) == 0 {
+		log.Println("[LoadFromGistAPI] ModelMappings is empty, seeding defaults...")
+		cfg.ModelMappings = getDefaultModelMappings()
+		log.Printf("[LoadFromGistAPI] Seeded %d default model mappings", len(cfg.ModelMappings))
+	} else {
+		log.Printf("[LoadFromGistAPI] ModelMappings already exists with %d entries", len(cfg.ModelMappings))
 	}
+
+	// Save to local file as backup (and persist defaults if seeded)
+	cfgPath = "data/config.json"
+	log.Printf("[LoadFromGistAPI] Saving config to local backup: %s", cfgPath)
+	if err := Save(); err != nil {
+		log.Printf("[LoadFromGistAPI] ERROR: Failed to save local config backup: %v", err)
+	} else {
+		log.Printf("[LoadFromGistAPI] Successfully saved local backup with %d model mappings", len(cfg.ModelMappings))
+	}
+
+	// Push to Gist to persist seeded defaults
+	ScheduleGistPush()
 
 	return nil
 }
