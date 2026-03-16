@@ -101,12 +101,12 @@ type FireworksConfig struct {
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
-	Password      string    `json:"password"`         // Admin panel password
-	Port          int       `json:"port"`             // HTTP server port (default: 8080)
-	Host          string    `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
-	ApiKey        string    `json:"apiKey,omitempty"` // API key for client authentication
-	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
-	Accounts      []Account `json:"accounts"`         // Registered Kiro accounts
+	Password      string    `json:"password"`          // Admin panel password
+	Port          int       `json:"port"`              // HTTP server port (default: 8080)
+	Host          string    `json:"host"`              // HTTP server bind address (default: 0.0.0.0)
+	ApiKeys       []string  `json:"apiKeys,omitempty"` // API keys for client authentication
+	RequireApiKey bool      `json:"requireApiKey"`     // Whether to enforce API key validation
+	Accounts      []Account `json:"accounts"`          // Registered Kiro accounts
 
 	// Provider configurations
 	Fireworks *FireworksConfig `json:"fireworks,omitempty"` // Fireworks AI provider config
@@ -426,10 +426,10 @@ func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) e
 	return nil
 }
 
-func GetApiKey() string {
+func GetApiKeys() []string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	return cfg.ApiKey
+	return cfg.ApiKeys
 }
 
 func IsApiKeyRequired() bool {
@@ -438,10 +438,10 @@ func IsApiKeyRequired() bool {
 	return cfg.RequireApiKey
 }
 
-func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
+func UpdateSettings(apiKeys []string, requireApiKey bool, password string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.ApiKey = apiKey
+	cfg.ApiKeys = apiKeys
 	cfg.RequireApiKey = requireApiKey
 	if password != "" {
 		cfg.Password = password

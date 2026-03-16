@@ -146,8 +146,8 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 		return true
 	}
 
-	expectedKey := config.GetApiKey()
-	if expectedKey == "" {
+	expectedKeys := config.GetApiKeys()
+	if len(expectedKeys) == 0 {
 		return true
 	}
 
@@ -162,7 +162,13 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 		providedKey = apiKeyHeader
 	}
 
-	return providedKey == expectedKey
+	// Check if providedKey matches any key in list
+	for _, key := range expectedKeys {
+		if providedKey == key {
+			return true
+		}
+	}
+	return false
 }
 
 // ServeHTTP 路由分发
@@ -2287,7 +2293,7 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":        config.GetApiKey(),
+		"apiKeys":       config.GetApiKeys(),
 		"requireApiKey": config.IsApiKeyRequired(),
 		"port":          config.GetPort(),
 		"host":          config.GetHost(),
@@ -2296,9 +2302,9 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey        string `json:"apiKey"`
-		RequireApiKey bool   `json:"requireApiKey"`
-		Password      string `json:"password"`
+		ApiKeys       []string `json:"apiKeys"`
+		RequireApiKey bool     `json:"requireApiKey"`
+		Password      string   `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2306,7 +2312,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := config.UpdateSettings(req.ApiKey, req.RequireApiKey, req.Password); err != nil {
+	if err := config.UpdateSettings(req.ApiKeys, req.RequireApiKey, req.Password); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

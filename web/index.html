@@ -965,8 +965,15 @@
                         <span data-i18n="settings.enableApiKey"></span>
                     </label>
                 </div>
-                <div class="form-group"><label>API Key</label><div style="display:flex;gap:8px;align-items:stretch"><input type="text" id="apiKeyInput" style="flex:1"
-                        data-i18n-placeholder="settings.apiKeyPlaceholder"><button class="btn btn-sm btn-secondary" onclick="generateApiKey()" data-i18n="settings.generateApiKey"></button></div></div>
+                <div class="form-group">
+                    <label>API Keys</label>
+                    <div id="apiKeysList" style="display:flex;flex-direction:column;gap:8px;margin-bottom:8px"></div>
+                    <div style="display:flex;gap:8px;align-items:stretch">
+                        <input type="text" id="newApiKeyInput" style="flex:1" placeholder="Enter new API key">
+                        <button class="btn btn-sm btn-secondary" onclick="generateApiKey()" data-i18n="settings.generateApiKey"></button>
+                        <button class="btn btn-sm btn-primary" onclick="addApiKey()">Add Key</button>
+                    </div>
+                </div>
                 <button class="btn btn-primary" onclick="saveSettings()" data-i18n="common.save"></button>
             </div>
             <div class="card">
@@ -2010,14 +2017,38 @@
                 if (acc) acc.weight = weight;
             } catch (e) { /* silent */ }
         }
+        let apiKeys = [];
         async function loadSettings() {
             const res = await fetch('/admin/api/settings', { headers: { 'X-Admin-Password': password } });
             const d = await res.json();
             document.getElementById('requireApiKey').checked = d.requireApiKey;
-            document.getElementById('apiKeyInput').value = d.apiKey || '';
+            apiKeys = d.apiKeys || [];
+            renderApiKeys();
             loadThinkingConfig();
             loadEndpointConfig();
             loadFireworksConfig();
+        }
+        function renderApiKeys() {
+            const list = document.getElementById('apiKeysList');
+            list.innerHTML = apiKeys.map((key, i) =>
+                `<div style="display:flex;gap:8px;align-items:center">
+                    <input type="text" value="${key}" readonly style="flex:1;background:#f8fafc">
+                    <button class="btn btn-sm btn-danger" onclick="removeApiKey(${i})">Remove</button>
+                </div>`
+            ).join('');
+        }
+        function addApiKey() {
+            const input = document.getElementById('newApiKeyInput');
+            const key = input.value.trim();
+            if (!key) return;
+            if (apiKeys.includes(key)) return alert('Key already exists');
+            apiKeys.push(key);
+            renderApiKeys();
+            input.value = '';
+        }
+        function removeApiKey(index) {
+            apiKeys.splice(index, 1);
+            renderApiKeys();
         }
         async function loadThinkingConfig() {
             const res = await fetch('/admin/api/thinking', { headers: { 'X-Admin-Password': password } });
@@ -2070,17 +2101,16 @@
             const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
             let key = 'sk-';
             for (let i = 0; i < 32; i++) key += chars.charAt(Math.floor(Math.random() * chars.length));
-            document.getElementById('apiKeyInput').value = key;
+            document.getElementById('newApiKeyInput').value = key;
         }
         async function saveSettings() {
             const requireApiKey = document.getElementById('requireApiKey').checked;
-            const apiKeyInput = document.getElementById('apiKeyInput');
-            if (requireApiKey && !apiKeyInput.value.trim()) {
-                generateApiKey();
+            if (requireApiKey && apiKeys.length === 0) {
+                return alert('Please add at least one API key');
             }
             await fetch('/admin/api/settings', {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                body: JSON.stringify({ requireApiKey, apiKey: apiKeyInput.value })
+                body: JSON.stringify({ requireApiKey, apiKeys })
             });
             alert(t('detail.saved'));
         }
