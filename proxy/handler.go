@@ -432,6 +432,32 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	fmt.Printf("[Claude Messages] Received request - Model: %s, Stream: %v\n", req.Model, req.Stream)
+
+	// Check if this is a Fireworks model
+	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
+		fmt.Printf("[Claude Messages] Routing to Fireworks provider (model prefix matched)\n")
+		// Convert Claude request to OpenAI format for Fireworks
+		openAIReq := &OpenAIRequest{
+			Model:    req.Model,
+			Messages: make([]OpenAIMessage, len(req.Messages)),
+			Stream:   req.Stream,
+		}
+		if req.MaxTokens > 0 {
+			openAIReq.MaxTokens = req.MaxTokens
+		}
+		for i, msg := range req.Messages {
+			openAIReq.Messages[i] = OpenAIMessage{
+				Role:    msg.Role,
+				Content: msg.Content,
+			}
+		}
+		h.handleFireworksRequest(w, openAIReq)
+		return
+	}
+
+	fmt.Printf("[Claude Messages] Routing to Kiro provider (Claude API endpoint)\n")
+
 	// 获取账号
 	account := h.pool.GetNext()
 	if account == nil {
@@ -1026,13 +1052,17 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	fmt.Printf("[OpenAI Chat] Received request - Model: %s, Stream: %v\n", req.Model, req.Stream)
+
 	// Check if this is a Fireworks model
 	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
+		fmt.Printf("[OpenAI Chat] Routing to Fireworks provider (model prefix matched)\n")
 		h.handleFireworksRequest(w, &req)
 		return
 	}
 
 	// Kiro flow (existing)
+	fmt.Printf("[OpenAI Chat] Routing to Kiro provider (default flow)\n")
 	account := h.pool.GetNext()
 	if account == nil {
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
