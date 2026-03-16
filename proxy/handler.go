@@ -1524,24 +1524,31 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 // ==================== Fireworks Provider ====================
 
 func (h *Handler) handleFireworksRequest(w http.ResponseWriter, req *OpenAIRequest) {
+	fmt.Printf("[Fireworks] Starting request - Model: %s, Stream: %v\n", req.Model, req.Stream)
+
 	fwCfg := config.GetFireworksConfig()
+	fmt.Printf("[Fireworks] Config loaded - Enabled: %v, BaseURL: %s\n", fwCfg.Enabled, fwCfg.BaseURL)
 
 	if !fwCfg.Enabled {
+		fmt.Println("[Fireworks] ERROR: Provider is disabled")
 		h.sendOpenAIError(w, 503, "provider_disabled", "Fireworks provider is not enabled")
 		return
 	}
 
 	if fwCfg.ApiKey == "" {
+		fmt.Println("[Fireworks] ERROR: API key not configured")
 		h.sendOpenAIError(w, 503, "provider_not_configured", "Fireworks API key not configured")
 		return
 	}
 
+	fmt.Println("[Fireworks] Configuration validated successfully")
 	atomic.AddInt64(&h.totalRequests, 1)
 
 	var responseData string
 
 	callback := &FireworksStreamCallback{
 		OnChunk: func(chunk string) error {
+			fmt.Printf("[Fireworks] Received chunk (length: %d)\n", len(chunk))
 			if req.Stream {
 				fmt.Fprintf(w, "data: %s\n\n", chunk)
 				if flusher, ok := w.(http.Flusher); ok {
@@ -1553,6 +1560,7 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, req *OpenAIReque
 			return nil
 		},
 		OnComplete: func(usage map[string]interface{}) error {
+			fmt.Printf("[Fireworks] Request completed - Usage: %+v\n", usage)
 			if promptTokens, ok := usage["prompt_tokens"].(float64); ok {
 				atomic.AddInt64(&h.totalTokens, int64(promptTokens))
 			}
@@ -1562,34 +1570,43 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, req *OpenAIReque
 			return nil
 		},
 		OnError: func(err error) {
+			fmt.Printf("[Fireworks] ERROR in callback: %v\n", err)
 			atomic.AddInt64(&h.failedRequests, 1)
 		},
 	}
 
 	if req.Stream {
+		fmt.Println("[Fireworks] Setting up streaming response headers")
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 	}
 
+	fmt.Println("[Fireworks] Calling Fireworks API...")
 	err := CallFireworksAPI(fwCfg.ApiKey, fwCfg.BaseURL, req, callback)
 	if err != nil {
+		fmt.Printf("[Fireworks] API call failed: %v\n", err)
 		atomic.AddInt64(&h.failedRequests, 1)
 		h.sendOpenAIError(w, 500, "fireworks_error", err.Error())
 		return
 	}
 
+	fmt.Println("[Fireworks] API call completed successfully")
+
 	if req.Stream {
+		fmt.Println("[Fireworks] Sending [DONE] marker")
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
 	} else {
+		fmt.Printf("[Fireworks] Sending non-stream response (length: %d)\n", len(responseData))
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Write([]byte(responseData))
 	}
 
 	atomic.AddInt64(&h.successRequests, 1)
+	fmt.Println("[Fireworks] Request handled successfully")
 }
 
 // ==================== 管理 API ====================
