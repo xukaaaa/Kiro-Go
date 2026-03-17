@@ -29,6 +29,22 @@ type FireworksCallback struct {
 	OnError    func(err error)
 }
 
+type FireworksBillingResponse struct {
+	LineItems []struct {
+		Category   string `json:"category"`
+		TotalCost  struct {
+			Units string `json:"units"`
+			Nanos int32  `json:"nanos"`
+		} `json:"totalCost"`
+	} `json:"lineItems"`
+}
+
+func convertToUSD(units string, nanos int32) float64 {
+	var unitsInt int64
+	fmt.Sscanf(units, "%d", &unitsInt)
+	return float64(unitsInt) + float64(nanos)/1e9
+}
+
 func CallFireworksAPI(apiKey, baseURL string, reqBody []byte, callback *FireworksCallback) error {
 	log.Printf("[Fireworks] Starting API call to %s", baseURL)
 
@@ -200,4 +216,45 @@ func parseAnthropicSSE(body io.Reader, callback *FireworksCallback) error {
 	}
 
 	return nil
+}
+
+// FetchFireworksUsage fetches current month usage from Fireworks billing API
+func FetchFireworksUsage(apiKey, accountID string) (float64, error) {
+	now := time.Now().UTC()
+	startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	startOfNextMonth := startOfMonth.AddDate(0, 1, 0)
+
+	url := fmt.Sprintf("https://api.fireworks.ai/v1/accounts/%s/billing/summary?startTime=%s&endTime=%s",
+		accountID,
+		startOfMonth.Format("2006-01-02T15:04:05Z"),
+		startOfNextMonth.Format("2006-01-02T15:04:05Z"))
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := fireworksHttpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var billing FireworksBillingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&billing); err != nil {
+		return 0, fmt.Errorf("decode response: %w", err)
+	}
+
+	var totalCost float64
+	for _, item := range billing.LineItems {
+		totalCost += convertToUSD(item.TotalCost.Units, item.TotalCost.Nanos)
+	}
+
+	return totalCost, nil
 }
