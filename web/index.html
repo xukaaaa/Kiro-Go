@@ -164,6 +164,17 @@
             font-weight: 600;
         }
 
+        .usage-display {
+            margin-left: 10px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        .usage-warning {
+            color: #dc3545;
+            font-weight: bold;
+        }
+
         .card-actions {
             display: flex;
             gap: 8px;
@@ -1019,7 +1030,13 @@
                     data-i18n="settings.saveEndpoint"></button>
             </div>
             <div class="card">
-                <div class="card-header"><span class="card-title" data-i18n="settings.fireworksSettings"></span></div>
+                <div class="card-header">
+                    <span class="card-title" data-i18n="settings.fireworksSettings"></span>
+                    <div style="display:flex;align-items:center;gap:8px">
+                        <span id="fireworksUsage" class="usage-display"></span>
+                        <button class="btn btn-sm" onclick="updateFireworksUsage()" title="Refresh usage" style="padding:4px 8px;font-size:12px">🔄</button>
+                    </div>
+                </div>
                 <div class="form-group">
                     <label style="display:flex;align-items:center;gap:10px">
                         <label class="switch"><input type="checkbox" id="fireworksEnabled"><span class="slider"></span></label>
@@ -1029,6 +1046,10 @@
                 <div class="form-group">
                     <label>Fireworks API Key</label>
                     <input type="text" id="fireworksApiKey" placeholder="fw_xxxxx">
+                </div>
+                <div class="form-group">
+                    <label>Fireworks Account ID</label>
+                    <input type="text" id="fireworksAccountId" placeholder="resource-xxxxx">
                 </div>
                 <div class="form-group">
                     <label>Fireworks Base URL</label>
@@ -2083,7 +2104,9 @@
             const d = await res.json();
             document.getElementById('fireworksEnabled').checked = d.enabled || false;
             document.getElementById('fireworksApiKey').value = d.apiKey || '';
+            document.getElementById('fireworksAccountId').value = d.accountId || '';
             document.getElementById('fireworksBaseUrl').value = d.baseUrl || 'https://api.fireworks.ai/inference/v1';
+            updateFireworksUsage();
         }
         async function saveFireworksConfig() {
             const res = await fetch('/admin/api/fireworks', {
@@ -2091,12 +2114,31 @@
                 body: JSON.stringify({
                     enabled: document.getElementById('fireworksEnabled').checked,
                     apiKey: document.getElementById('fireworksApiKey').value,
+                    accountId: document.getElementById('fireworksAccountId').value,
                     baseUrl: document.getElementById('fireworksBaseUrl').value
                 })
             });
             const d = await res.json();
-            if (d.success) { alert(t('settings.fireworksSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
+            if (d.success) { alert(t('settings.fireworksSaved')); updateFireworksUsage(); } else { alert(t('common.saveFailed') + ': ' + d.error); }
         }
+        async function updateFireworksUsage() {
+            try {
+                const res = await fetch('/admin/api/fireworks/usage', { headers: { 'X-Admin-Password': password } });
+                const d = await res.json();
+                const usageEl = document.getElementById('fireworksUsage');
+                if (d.enabled && d.usageCost > 0) {
+                    usageEl.textContent = `($${d.usageCost.toFixed(2)})`;
+                    usageEl.className = d.showWarning ? 'usage-display usage-warning' : 'usage-display';
+                    usageEl.title = d.showWarning ? `Warning: Usage is within $1 of $${d.limit} limit` : '';
+                } else {
+                    usageEl.textContent = '';
+                    usageEl.className = 'usage-display';
+                }
+            } catch (err) {
+                console.error('Failed to fetch Fireworks usage:', err);
+            }
+        }
+        setInterval(updateFireworksUsage, 60000);
         function generateApiKey() {
             const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
             let key = 'sk-';

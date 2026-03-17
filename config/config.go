@@ -93,9 +93,12 @@ type Account struct {
 
 // FireworksConfig represents Fireworks AI provider configuration.
 type FireworksConfig struct {
-	Enabled bool   `json:"enabled"`           // Whether Fireworks provider is enabled
-	ApiKey  string `json:"apiKey,omitempty"`  // Fireworks API key
-	BaseURL string `json:"baseUrl,omitempty"` // Fireworks API base URL
+	Enabled        bool    `json:"enabled"`                  // Whether Fireworks provider is enabled
+	ApiKey         string  `json:"apiKey,omitempty"`         // Fireworks API key
+	BaseURL        string  `json:"baseUrl,omitempty"`        // Fireworks API base URL
+	AccountID      string  `json:"accountId,omitempty"`      // Fireworks account ID for billing
+	UsageCost      float64 `json:"usageCost,omitempty"`      // Cached usage cost in USD
+	LastUsageCheck int64   `json:"lastUsageCheck,omitempty"` // Last usage check timestamp (Unix seconds)
 }
 
 // Config represents the global application configuration.
@@ -743,7 +746,7 @@ func GetFireworksConfig() FireworksConfig {
 }
 
 // UpdateFireworksConfig updates Fireworks configuration
-func UpdateFireworksConfig(enabled bool, apiKey, baseURL string) error {
+func UpdateFireworksConfig(enabled bool, apiKey, baseURL, accountID string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg.Fireworks == nil {
@@ -751,10 +754,23 @@ func UpdateFireworksConfig(enabled bool, apiKey, baseURL string) error {
 	}
 	cfg.Fireworks.Enabled = enabled
 	cfg.Fireworks.ApiKey = apiKey
+	cfg.Fireworks.AccountID = accountID
 	if baseURL != "" {
 		cfg.Fireworks.BaseURL = baseURL
 	} else {
 		cfg.Fireworks.BaseURL = "https://api.fireworks.ai/inference/v1"
 	}
+	return Save()
+}
+
+// UpdateFireworksUsage updates cached usage data
+func UpdateFireworksUsage(usageCost float64, timestamp int64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.Fireworks == nil {
+		return fmt.Errorf("fireworks config not initialized")
+	}
+	cfg.Fireworks.UsageCost = usageCost
+	cfg.Fireworks.LastUsageCheck = timestamp
 	return Save()
 }

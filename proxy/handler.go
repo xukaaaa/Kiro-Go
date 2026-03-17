@@ -7,6 +7,7 @@ import (
 	"kiro-api-proxy/auth"
 	"kiro-api-proxy/config"
 	"kiro-api-proxy/pool"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -435,6 +436,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	var req ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
+		return
+	}
+
+	// Check if this is a Fireworks model
+	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
+		h.handleFireworksRequest(w, body)
 		return
 	}
 
@@ -901,6 +908,34 @@ func (h *Handler) saveStats() {
 	)
 }
 
+// refreshFireworksUsage 后台定时刷新 Fireworks 使用量
+func (h *Handler) refreshFireworksUsage() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			cfg := config.GetFireworksConfig()
+			if !cfg.Enabled || cfg.ApiKey == "" || cfg.AccountID == "" {
+				continue
+			}
+
+			usage, err := FetchFireworksUsage(cfg.ApiKey, cfg.AccountID)
+			if err != nil {
+				log.Printf("[Fireworks] Failed to fetch usage: %v", err)
+				continue
+			}
+
+			config.UpdateFireworksUsage(usage, time.Now().Unix())
+			log.Printf("[Fireworks] Usage updated: $%.2f", usage)
+
+		case <-h.stopRefresh:
+			return
+		}
+	}
+}
+
 // getCredits 线程安全获取 credits
 func (h *Handler) getCredits() float64 {
 	h.creditsMu.RLock()
@@ -1034,11 +1069,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is a Fireworks model
 	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
-		h.handleFireworksRequest(w, &req)
+		h.handleFireworksRequest(w, body)
 		return
 	}
 
-	// Kiro flow (existing)
 	account := h.pool.GetNext()
 	if account == nil {
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
@@ -1529,73 +1563,112 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 
 // ==================== Fireworks Provider ====================
 
-func (h *Handler) handleFireworksRequest(w http.ResponseWriter, req *OpenAIRequest) {
+func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) {
+	log.Printf("[Handler] Fireworks request received, body length: %d bytes", len(reqBody))
+
+	// Parse and log request with truncated text fields
+	var reqMap map[string]interface{}
+	if err := json.Unmarshal(reqBody, &reqMap); err == nil {
+		// Get all top-level keys
+		keys := make([]string, 0, len(reqMap))
+		for k := range reqMap {
+			keys = append(keys, k)
+		}
+		log.Printf("[Handler] Request top-level keys: %v", keys)
+
+		// Truncate text content in messages for logging
+		if messages, ok := reqMap["messages"].([]interface{}); ok {
+			for _, msg := range messages {
+				if msgMap, ok := msg.(map[string]interface{}); ok {
+					if content, ok := msgMap["content"].([]interface{}); ok {
+						for _, c := range content {
+							if cMap, ok := c.(map[string]interface{}); ok {
+								if text, ok := cMap["text"].(string); ok && len(text) > 500 {
+									cMap["text"] = text[:500] + "... [truncated]"
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Log truncated request
+		truncatedJSON, _ := json.Marshal(reqMap)
+		if len(truncatedJSON) > 2000 {
+			log.Printf("[Handler] Request body (truncated): %s...", string(truncatedJSON[:2000]))
+		} else {
+			log.Printf("[Handler] Request body (truncated): %s", string(truncatedJSON))
+		}
+	}
+
 	fwCfg := config.GetFireworksConfig()
+	log.Printf("[Handler] Fireworks config - enabled: %v, baseURL: %s", fwCfg.Enabled, fwCfg.BaseURL)
 
 	if !fwCfg.Enabled {
+		log.Printf("[Handler] Fireworks provider is disabled")
 		h.sendOpenAIError(w, 503, "provider_disabled", "Fireworks provider is not enabled")
 		return
 	}
 
 	if fwCfg.ApiKey == "" {
+		log.Printf("[Handler] Fireworks API key not configured")
 		h.sendOpenAIError(w, 503, "provider_not_configured", "Fireworks API key not configured")
 		return
 	}
 
 	atomic.AddInt64(&h.totalRequests, 1)
 
-	var responseData string
+	var req map[string]interface{}
+	json.Unmarshal(reqBody, &req)
+	clientStream := req["stream"] == true
+	log.Printf("[Handler] Request model: %v, client stream: %v (will always return streaming response)", req["model"], clientStream)
 
-	callback := &FireworksStreamCallback{
+	chunkCount := 0
+
+	callback := &FireworksCallback{
 		OnChunk: func(chunk string) error {
-			if req.Stream {
-				fmt.Fprintf(w, "data: %s\n\n", chunk)
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
-			} else {
-				responseData = chunk
+			chunkCount++
+			if chunkCount <= 3 || chunkCount%50 == 0 {
+				log.Printf("[Handler] OnChunk #%d called, chunk length: %d", chunkCount, len(chunk))
+			}
+			// Always stream to client
+			fmt.Fprintf(w, "%s", chunk)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
 			}
 			return nil
 		},
-		OnComplete: func(usage map[string]interface{}) error {
-			if promptTokens, ok := usage["prompt_tokens"].(float64); ok {
-				atomic.AddInt64(&h.totalTokens, int64(promptTokens))
-			}
-			if completionTokens, ok := usage["completion_tokens"].(float64); ok {
-				atomic.AddInt64(&h.totalTokens, int64(completionTokens))
-			}
+		OnComplete: func(inputTokens, outputTokens int64) error {
+			log.Printf("[Handler] OnComplete called - input: %d, output: %d tokens", inputTokens, outputTokens)
+			atomic.AddInt64(&h.totalTokens, inputTokens+outputTokens)
 			return nil
 		},
 		OnError: func(err error) {
+			log.Printf("[Handler] OnError called: %v", err)
 			atomic.AddInt64(&h.failedRequests, 1)
 		},
 	}
 
-	if req.Stream {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-	}
+	// Always set streaming headers
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	log.Printf("[Handler] Set streaming headers")
 
-	err := CallFireworksAPI(fwCfg.ApiKey, fwCfg.BaseURL, req, callback)
+	log.Printf("[Handler] Calling Fireworks API...")
+	err := CallFireworksAPI(fwCfg.ApiKey, fwCfg.BaseURL, reqBody, callback)
 	if err != nil {
+		log.Printf("[Handler] Fireworks API call failed: %v", err)
 		atomic.AddInt64(&h.failedRequests, 1)
 		h.sendOpenAIError(w, 500, "fireworks_error", err.Error())
 		return
 	}
 
-	if req.Stream {
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-	} else {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Write([]byte(responseData))
-	}
+	log.Printf("[Handler] Fireworks API call completed successfully, total chunks: %d", chunkCount)
 
 	atomic.AddInt64(&h.successRequests, 1)
+	log.Printf("[Handler] Request completed successfully")
 }
 
 // ==================== 管理 API ====================
@@ -1675,6 +1748,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetFireworksConfig(w, r)
 	case path == "/fireworks" && r.Method == "POST":
 		h.apiUpdateFireworksConfig(w, r)
+	case path == "/fireworks/usage" && r.Method == "GET":
+		h.apiGetFireworksUsage(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -2643,18 +2718,22 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 func (h *Handler) apiGetFireworksConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.GetFireworksConfig()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"enabled": cfg.Enabled,
-		"apiKey":  cfg.ApiKey,
-		"baseUrl": cfg.BaseURL,
+		"enabled":        cfg.Enabled,
+		"apiKey":         cfg.ApiKey,
+		"baseUrl":        cfg.BaseURL,
+		"accountId":      cfg.AccountID,
+		"usageCost":      cfg.UsageCost,
+		"lastUsageCheck": cfg.LastUsageCheck,
 	})
 }
 
 // apiUpdateFireworksConfig 更新 Fireworks 配置
 func (h *Handler) apiUpdateFireworksConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Enabled bool   `json:"enabled"`
-		ApiKey  string `json:"apiKey"`
-		BaseUrl string `json:"baseUrl"`
+		Enabled   bool   `json:"enabled"`
+		ApiKey    string `json:"apiKey"`
+		BaseUrl   string `json:"baseUrl"`
+		AccountId string `json:"accountId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2662,13 +2741,55 @@ func (h *Handler) apiUpdateFireworksConfig(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := config.UpdateFireworksConfig(req.Enabled, req.ApiKey, req.BaseUrl); err != nil {
+	if err := config.UpdateFireworksConfig(req.Enabled, req.ApiKey, req.BaseUrl, req.AccountId); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
+	// Trigger immediate usage fetch if accountId changed
+	if req.AccountId != "" && req.ApiKey != "" {
+		go func() {
+			usage, err := FetchFireworksUsage(req.ApiKey, req.AccountId)
+			if err != nil {
+				log.Printf("[Fireworks] Failed to fetch usage after config update: %v", err)
+				return
+			}
+			config.UpdateFireworksUsage(usage, time.Now().Unix())
+			log.Printf("[Fireworks] Usage fetched after config update: $%.2f", usage)
+		}()
+	}
+
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiGetFireworksUsage 获取 Fireworks 使用量
+func (h *Handler) apiGetFireworksUsage(w http.ResponseWriter, r *http.Request) {
+	cfg := config.GetFireworksConfig()
+
+	// Fetch real-time usage if enabled and configured
+	var usageCost float64
+	if cfg.Enabled && cfg.ApiKey != "" && cfg.AccountID != "" {
+		usage, err := FetchFireworksUsage(cfg.ApiKey, cfg.AccountID)
+		if err != nil {
+			log.Printf("[Fireworks] Failed to fetch usage: %v", err)
+			usageCost = cfg.UsageCost // fallback to cached value
+		} else {
+			usageCost = usage
+			config.UpdateFireworksUsage(usage, time.Now().Unix())
+		}
+	} else {
+		usageCost = cfg.UsageCost
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":          cfg.Enabled,
+		"usageCost":        usageCost,
+		"lastCheck":        time.Now().Unix(),
+		"warningThreshold": 5.0,
+		"limit":            6.0,
+		"showWarning":      usageCost >= 5.0,
+	})
 }
 
 // apiGetVersion 获取版本信息

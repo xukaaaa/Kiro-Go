@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -22,100 +23,238 @@ var fireworksHttpClient = &http.Client{
 	},
 }
 
-type FireworksStreamCallback struct {
+type FireworksCallback struct {
 	OnChunk    func(chunk string) error
-	OnComplete func(usage map[string]interface{}) error
+	OnComplete func(inputTokens, outputTokens int64) error
 	OnError    func(err error)
 }
 
-func CallFireworksAPI(apiKey, baseURL string, req *OpenAIRequest, callback *FireworksStreamCallback) error {
-	reqBody, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
+type FireworksBillingResponse struct {
+	LineItems []struct {
+		Category   string `json:"category"`
+		TotalCost  struct {
+			Units string `json:"units"`
+			Nanos int32  `json:"nanos"`
+		} `json:"totalCost"`
+	} `json:"lineItems"`
+}
+
+func convertToUSD(units string, nanos int32) float64 {
+	var unitsInt int64
+	fmt.Sscanf(units, "%d", &unitsInt)
+	return float64(unitsInt) + float64(nanos)/1e9
+}
+
+func CallFireworksAPI(apiKey, baseURL string, reqBody []byte, callback *FireworksCallback) error {
+	log.Printf("[Fireworks] Starting API call to %s", baseURL)
+
+	// Filter unsupported parameters
+	var req map[string]interface{}
+	if err := json.Unmarshal(reqBody, &req); err != nil {
+		log.Printf("[Fireworks] Failed to unmarshal request: %v", err)
+		return fmt.Errorf("unmarshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequest("POST", baseURL+"/chat/completions", bytes.NewReader(reqBody))
+	log.Printf("[Fireworks] Original request model: %v, stream: %v, max_tokens: %v", req["model"], req["stream"], req["max_tokens"])
+
+	// Filter unsupported parameters
+	delete(req, "disable_parallel_tool_use")
+	delete(req, "stop_sequences")
+	delete(req, "context_management")
+	delete(req, "thinking")
+	delete(req, "metadata")
+	delete(req, "output_config")
+
+	// Handle tool_choice: "none"
+	if tc, ok := req["tool_choice"].(map[string]interface{}); ok {
+		if tc["type"] == "none" {
+			log.Printf("[Fireworks] Removing tools due to tool_choice:none")
+			delete(req, "tools")
+			delete(req, "tool_choice")
+		}
+	}
+
+	// Always force streaming mode
+	originalStream := req["stream"]
+	req["stream"] = true
+	log.Printf("[Fireworks] Forcing stream=true (original: %v)", originalStream)
+
+	filteredBody, _ := json.Marshal(req)
+	log.Printf("[Fireworks] Filtered request body length: %d bytes", len(filteredBody))
+
+	// Log filtered request keys to verify filtering worked
+	filteredKeys := make([]string, 0, len(req))
+	for k := range req {
+		filteredKeys = append(filteredKeys, k)
+	}
+	log.Printf("[Fireworks] Filtered request keys: %v", filteredKeys)
+
+	// Log first 1000 chars of filtered body
+	if len(filteredBody) > 1000 {
+		log.Printf("[Fireworks] Filtered body preview: %s...", string(filteredBody[:1000]))
+	} else {
+		log.Printf("[Fireworks] Filtered body: %s", string(filteredBody))
+	}
+
+	endpoint := baseURL + "/messages"
+	log.Printf("[Fireworks] Calling endpoint: %s", endpoint)
+
+	httpReq, err := http.NewRequest("POST", endpoint, bytes.NewReader(filteredBody))
 	if err != nil {
+		log.Printf("[Fireworks] Failed to create HTTP request: %v", err)
 		return fmt.Errorf("create request: %w", err)
 	}
 
+	// Log API key (masked)
+	maskedKey := apiKey
+	if len(apiKey) > 20 {
+		maskedKey = apiKey[:10] + "..." + apiKey[len(apiKey)-4:]
+	} else if len(apiKey) > 10 {
+		maskedKey = apiKey[:10] + "..."
+	}
+	log.Printf("[Fireworks] Using API key: %s (length: %d)", maskedKey, len(apiKey))
+
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := fireworksHttpClient.Do(httpReq)
 	if err != nil {
+		log.Printf("[Fireworks] HTTP request failed: %v", err)
 		return fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
 
+	log.Printf("[Fireworks] Response status: %d", resp.StatusCode)
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[Fireworks] API error response: %s", string(body))
 		return fmt.Errorf("fireworks API error %d: %s", resp.StatusCode, string(body))
 	}
 
-	if req.Stream {
-		return parseFireworksSSE(resp.Body, callback)
-	}
-
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode response: %w", err)
-	}
-
-	resultJSON, _ := json.Marshal(result)
-	if callback.OnChunk != nil {
-		callback.OnChunk(string(resultJSON))
-	}
-	if callback.OnComplete != nil {
-		if usage, ok := result["usage"].(map[string]interface{}); ok {
-			callback.OnComplete(usage)
-		}
-	}
-	return nil
+	// Always use streaming mode
+	log.Printf("[Fireworks] Processing streaming response")
+	return parseAnthropicSSE(resp.Body, callback)
 }
 
-func parseFireworksSSE(body io.Reader, callback *FireworksStreamCallback) error {
+func parseAnthropicSSE(body io.Reader, callback *FireworksCallback) error {
+	log.Printf("[Fireworks] Starting SSE parsing")
+
 	scanner := bufio.NewScanner(body)
-	var lastUsage map[string]interface{}
+	scanner.Buffer(make([]byte, 64*1024), 50*1024*1024) // 50MB max buffer
+
+	var inputTokens, outputTokens int64
+	eventCount := 0
+	var sseBuffer strings.Builder
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
 
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			break
-		}
+		// Forward raw line to callback
+		if callback.OnChunk != nil {
+			sseBuffer.WriteString(line)
+			sseBuffer.WriteString("\n")
 
-		// Parse chunk to extract usage if present
-		var chunk map[string]interface{}
-		if err := json.Unmarshal([]byte(data), &chunk); err == nil {
-			if usage, ok := chunk["usage"].(map[string]interface{}); ok && usage != nil {
-				lastUsage = usage
+			// On empty line, flush accumulated SSE event
+			if strings.TrimSpace(line) == "" && sseBuffer.Len() > 1 {
+				if err := callback.OnChunk(sseBuffer.String()); err != nil {
+					log.Printf("[Fireworks] OnChunk callback error: %v", err)
+					return err
+				}
+				sseBuffer.Reset()
 			}
 		}
 
-		if callback.OnChunk != nil {
-			if err := callback.OnChunk(data); err != nil {
-				return err
+		// Parse for token tracking (keep existing logic)
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "data:") {
+			eventCount++
+			dataJSON := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+
+			var event map[string]interface{}
+			if err := json.Unmarshal([]byte(dataJSON), &event); err == nil {
+				eventType := event["type"]
+				if eventCount <= 5 || eventType == "message_delta" || eventType == "message_stop" {
+					log.Printf("[Fireworks] SSE event #%d type: %v", eventCount, eventType)
+				}
+
+				// Extract token usage
+				if event["type"] == "message_delta" {
+					if usage, ok := event["usage"].(map[string]interface{}); ok {
+						if ot, ok := usage["output_tokens"].(float64); ok {
+							outputTokens = int64(ot)
+							log.Printf("[Fireworks] Updated output_tokens: %d", outputTokens)
+						}
+					}
+				} else if event["type"] == "message_start" {
+					if msg, ok := event["message"].(map[string]interface{}); ok {
+						if usage, ok := msg["usage"].(map[string]interface{}); ok {
+							if it, ok := usage["input_tokens"].(float64); ok {
+								inputTokens = int64(it)
+								log.Printf("[Fireworks] Got input_tokens: %d", inputTokens)
+							}
+						}
+					}
+				}
 			}
 		}
 	}
 
+	log.Printf("[Fireworks] SSE parsing complete. Total events: %d, input_tokens: %d, output_tokens: %d", eventCount, inputTokens, outputTokens)
+
 	if err := scanner.Err(); err != nil {
+		log.Printf("[Fireworks] Scanner error: %v", err)
 		if callback.OnError != nil {
 			callback.OnError(err)
 		}
 		return err
 	}
 
-	// Call OnComplete with final usage stats
-	if callback.OnComplete != nil && lastUsage != nil {
-		callback.OnComplete(lastUsage)
+	if callback.OnComplete != nil {
+		callback.OnComplete(inputTokens, outputTokens)
 	}
 
 	return nil
+}
+
+// FetchFireworksUsage fetches current month usage from Fireworks billing API
+func FetchFireworksUsage(apiKey, accountID string) (float64, error) {
+	now := time.Now().UTC()
+	startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	startOfNextMonth := startOfMonth.AddDate(0, 1, 0)
+
+	url := fmt.Sprintf("https://api.fireworks.ai/v1/accounts/%s/billing/summary?startTime=%s&endTime=%s",
+		accountID,
+		startOfMonth.Format("2006-01-02T15:04:05Z"),
+		startOfNextMonth.Format("2006-01-02T15:04:05Z"))
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := fireworksHttpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var billing FireworksBillingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&billing); err != nil {
+		return 0, fmt.Errorf("decode response: %w", err)
+	}
+
+	var totalCost float64
+	for _, item := range billing.LineItems {
+		totalCost += convertToUSD(item.TotalCost.Units, item.TotalCost.Nanos)
+	}
+
+	return totalCost, nil
 }
