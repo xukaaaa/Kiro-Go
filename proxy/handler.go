@@ -1032,13 +1032,6 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this is a Fireworks model
-	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
-		h.handleFireworksRequest(w, &req)
-		return
-	}
-
-	// Kiro flow (existing)
 	account := h.pool.GetNext()
 	if account == nil {
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
@@ -1527,77 +1520,6 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	return nil
 }
 
-// ==================== Fireworks Provider ====================
-
-func (h *Handler) handleFireworksRequest(w http.ResponseWriter, req *OpenAIRequest) {
-	fwCfg := config.GetFireworksConfig()
-
-	if !fwCfg.Enabled {
-		h.sendOpenAIError(w, 503, "provider_disabled", "Fireworks provider is not enabled")
-		return
-	}
-
-	if fwCfg.ApiKey == "" {
-		h.sendOpenAIError(w, 503, "provider_not_configured", "Fireworks API key not configured")
-		return
-	}
-
-	atomic.AddInt64(&h.totalRequests, 1)
-
-	var responseData string
-
-	callback := &FireworksStreamCallback{
-		OnChunk: func(chunk string) error {
-			if req.Stream {
-				fmt.Fprintf(w, "data: %s\n\n", chunk)
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
-			} else {
-				responseData = chunk
-			}
-			return nil
-		},
-		OnComplete: func(usage map[string]interface{}) error {
-			if promptTokens, ok := usage["prompt_tokens"].(float64); ok {
-				atomic.AddInt64(&h.totalTokens, int64(promptTokens))
-			}
-			if completionTokens, ok := usage["completion_tokens"].(float64); ok {
-				atomic.AddInt64(&h.totalTokens, int64(completionTokens))
-			}
-			return nil
-		},
-		OnError: func(err error) {
-			atomic.AddInt64(&h.failedRequests, 1)
-		},
-	}
-
-	if req.Stream {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-	}
-
-	err := CallFireworksAPI(fwCfg.ApiKey, fwCfg.BaseURL, req, callback)
-	if err != nil {
-		atomic.AddInt64(&h.failedRequests, 1)
-		h.sendOpenAIError(w, 500, "fireworks_error", err.Error())
-		return
-	}
-
-	if req.Stream {
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-	} else {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Write([]byte(responseData))
-	}
-
-	atomic.AddInt64(&h.successRequests, 1)
-}
-
 // ==================== 管理 API ====================
 
 func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
@@ -1671,10 +1593,6 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetEndpointConfig(w, r)
 	case path == "/endpoint" && r.Method == "POST":
 		h.apiUpdateEndpointConfig(w, r)
-	case path == "/fireworks" && r.Method == "GET":
-		h.apiGetFireworksConfig(w, r)
-	case path == "/fireworks" && r.Method == "POST":
-		h.apiUpdateFireworksConfig(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -2631,38 +2549,6 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := config.UpdatePreferredEndpoint(req.PreferredEndpoint); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string]bool{"success": true})
-}
-
-// apiGetFireworksConfig 获取 Fireworks 配置
-func (h *Handler) apiGetFireworksConfig(w http.ResponseWriter, r *http.Request) {
-	cfg := config.GetFireworksConfig()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"enabled": cfg.Enabled,
-		"apiKey":  cfg.ApiKey,
-		"baseUrl": cfg.BaseURL,
-	})
-}
-
-// apiUpdateFireworksConfig 更新 Fireworks 配置
-func (h *Handler) apiUpdateFireworksConfig(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Enabled bool   `json:"enabled"`
-		ApiKey  string `json:"apiKey"`
-		BaseUrl string `json:"baseUrl"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	if err := config.UpdateFireworksConfig(req.Enabled, req.ApiKey, req.BaseUrl); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
