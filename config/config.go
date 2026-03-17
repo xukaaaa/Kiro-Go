@@ -449,7 +449,11 @@ func UpdateSettings(apiKeys []string, requireApiKey bool, password string) error
 	if password != "" {
 		cfg.Password = password
 	}
-	return Save()
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
 }
 
 func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
@@ -561,7 +565,11 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
-	return Save()
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
 }
 
 // GetPreferredEndpoint 获取首选端点配置
@@ -579,7 +587,11 @@ func UpdatePreferredEndpoint(endpoint string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.PreferredEndpoint = endpoint
-	return Save()
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
 }
 
 // ==================== Gist Sync ====================
@@ -760,7 +772,11 @@ func UpdateFireworksConfig(enabled bool, apiKey, baseURL, accountID string) erro
 	} else {
 		cfg.Fireworks.BaseURL = "https://api.fireworks.ai/inference/v1"
 	}
-	return Save()
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
 }
 
 // UpdateFireworksUsage updates cached usage data
@@ -772,5 +788,9 @@ func UpdateFireworksUsage(usageCost float64, timestamp int64) error {
 	}
 	cfg.Fireworks.UsageCost = usageCost
 	cfg.Fireworks.LastUsageCheck = timestamp
-	return Save()
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
 }
