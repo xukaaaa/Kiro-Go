@@ -7,6 +7,7 @@ import (
 	"kiro-api-proxy/auth"
 	"kiro-api-proxy/config"
 	"kiro-api-proxy/pool"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -435,6 +436,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	var req ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
+		return
+	}
+
+	// Check if this is a Fireworks model
+	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
+		h.handleFireworksRequest(w, body)
 		return
 	}
 
@@ -1032,6 +1039,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if this is a Fireworks model
+	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
+		h.handleFireworksRequest(w, body)
+		return
+	}
+
 	account := h.pool.GetNext()
 	if account == nil {
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
@@ -1520,6 +1533,133 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	return nil
 }
 
+// ==================== Fireworks Provider ====================
+
+func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) {
+	log.Printf("[Handler] Fireworks request received, body length: %d bytes", len(reqBody))
+
+	// Parse and log request with truncated text fields
+	var reqMap map[string]interface{}
+	if err := json.Unmarshal(reqBody, &reqMap); err == nil {
+		// Get all top-level keys
+		keys := make([]string, 0, len(reqMap))
+		for k := range reqMap {
+			keys = append(keys, k)
+		}
+		log.Printf("[Handler] Request top-level keys: %v", keys)
+
+		// Truncate text content in messages for logging
+		if messages, ok := reqMap["messages"].([]interface{}); ok {
+			for _, msg := range messages {
+				if msgMap, ok := msg.(map[string]interface{}); ok {
+					if content, ok := msgMap["content"].([]interface{}); ok {
+						for _, c := range content {
+							if cMap, ok := c.(map[string]interface{}); ok {
+								if text, ok := cMap["text"].(string); ok && len(text) > 500 {
+									cMap["text"] = text[:500] + "... [truncated]"
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Log truncated request
+		truncatedJSON, _ := json.Marshal(reqMap)
+		if len(truncatedJSON) > 2000 {
+			log.Printf("[Handler] Request body (truncated): %s...", string(truncatedJSON[:2000]))
+		} else {
+			log.Printf("[Handler] Request body (truncated): %s", string(truncatedJSON))
+		}
+	}
+
+	fwCfg := config.GetFireworksConfig()
+	log.Printf("[Handler] Fireworks config - enabled: %v, baseURL: %s", fwCfg.Enabled, fwCfg.BaseURL)
+
+	if !fwCfg.Enabled {
+		log.Printf("[Handler] Fireworks provider is disabled")
+		h.sendOpenAIError(w, 503, "provider_disabled", "Fireworks provider is not enabled")
+		return
+	}
+
+	if fwCfg.ApiKey == "" {
+		log.Printf("[Handler] Fireworks API key not configured")
+		h.sendOpenAIError(w, 503, "provider_not_configured", "Fireworks API key not configured")
+		return
+	}
+
+	atomic.AddInt64(&h.totalRequests, 1)
+
+	var req map[string]interface{}
+	json.Unmarshal(reqBody, &req)
+	isStream := req["stream"] == true
+	log.Printf("[Handler] Request model: %v, stream: %v", req["model"], isStream)
+
+	var responseData string
+	chunkCount := 0
+
+	callback := &FireworksCallback{
+		OnChunk: func(chunk string) error {
+			chunkCount++
+			if chunkCount <= 3 || chunkCount%50 == 0 {
+				log.Printf("[Handler] OnChunk #%d called, chunk length: %d", chunkCount, len(chunk))
+			}
+			if isStream {
+				fmt.Fprintf(w, "event: content_block_delta\ndata: %s\n\n", chunk)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			} else {
+				responseData = chunk
+			}
+			return nil
+		},
+		OnComplete: func(inputTokens, outputTokens int64) error {
+			log.Printf("[Handler] OnComplete called - input: %d, output: %d tokens", inputTokens, outputTokens)
+			atomic.AddInt64(&h.totalTokens, inputTokens+outputTokens)
+			return nil
+		},
+		OnError: func(err error) {
+			log.Printf("[Handler] OnError called: %v", err)
+			atomic.AddInt64(&h.failedRequests, 1)
+		},
+	}
+
+	if isStream {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		log.Printf("[Handler] Set streaming headers")
+	}
+
+	log.Printf("[Handler] Calling Fireworks API...")
+	err := CallFireworksAPI(fwCfg.ApiKey, fwCfg.BaseURL, reqBody, callback)
+	if err != nil {
+		log.Printf("[Handler] Fireworks API call failed: %v", err)
+		atomic.AddInt64(&h.failedRequests, 1)
+		h.sendOpenAIError(w, 500, "fireworks_error", err.Error())
+		return
+	}
+
+	log.Printf("[Handler] Fireworks API call completed successfully, total chunks: %d", chunkCount)
+
+	if isStream {
+		fmt.Fprintf(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		log.Printf("[Handler] Sent message_stop event")
+	} else {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Write([]byte(responseData))
+		log.Printf("[Handler] Sent non-streaming response, length: %d bytes", len(responseData))
+	}
+
+	atomic.AddInt64(&h.successRequests, 1)
+	log.Printf("[Handler] Request completed successfully")
+}
+
 // ==================== 管理 API ====================
 
 func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
@@ -1593,6 +1733,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetEndpointConfig(w, r)
 	case path == "/endpoint" && r.Method == "POST":
 		h.apiUpdateEndpointConfig(w, r)
+	case path == "/fireworks" && r.Method == "GET":
+		h.apiGetFireworksConfig(w, r)
+	case path == "/fireworks" && r.Method == "POST":
+		h.apiUpdateFireworksConfig(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -2549,6 +2693,38 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	if err := config.UpdatePreferredEndpoint(req.PreferredEndpoint); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiGetFireworksConfig 获取 Fireworks 配置
+func (h *Handler) apiGetFireworksConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := config.GetFireworksConfig()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled": cfg.Enabled,
+		"apiKey":  cfg.ApiKey,
+		"baseUrl": cfg.BaseURL,
+	})
+}
+
+// apiUpdateFireworksConfig 更新 Fireworks 配置
+func (h *Handler) apiUpdateFireworksConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool   `json:"enabled"`
+		ApiKey  string `json:"apiKey"`
+		BaseUrl string `json:"baseUrl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	if err := config.UpdateFireworksConfig(req.Enabled, req.ApiKey, req.BaseUrl); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
