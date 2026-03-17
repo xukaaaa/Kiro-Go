@@ -1593,10 +1593,9 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) 
 
 	var req map[string]interface{}
 	json.Unmarshal(reqBody, &req)
-	isStream := req["stream"] == true
-	log.Printf("[Handler] Request model: %v, stream: %v", req["model"], isStream)
+	clientStream := req["stream"] == true
+	log.Printf("[Handler] Request model: %v, client stream: %v (will always return streaming response)", req["model"], clientStream)
 
-	var responseData string
 	chunkCount := 0
 
 	callback := &FireworksCallback{
@@ -1605,13 +1604,10 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) 
 			if chunkCount <= 3 || chunkCount%50 == 0 {
 				log.Printf("[Handler] OnChunk #%d called, chunk length: %d", chunkCount, len(chunk))
 			}
-			if isStream {
-				fmt.Fprintf(w, "event: content_block_delta\ndata: %s\n\n", chunk)
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
-			} else {
-				responseData = chunk
+			// Always stream to client
+			fmt.Fprintf(w, "%s", chunk)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
 			}
 			return nil
 		},
@@ -1626,12 +1622,11 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) 
 		},
 	}
 
-	if isStream {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		log.Printf("[Handler] Set streaming headers")
-	}
+	// Always set streaming headers
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	log.Printf("[Handler] Set streaming headers")
 
 	log.Printf("[Handler] Calling Fireworks API...")
 	err := CallFireworksAPI(fwCfg.ApiKey, fwCfg.BaseURL, reqBody, callback)
@@ -1643,18 +1638,6 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) 
 	}
 
 	log.Printf("[Handler] Fireworks API call completed successfully, total chunks: %d", chunkCount)
-
-	if isStream {
-		fmt.Fprintf(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		log.Printf("[Handler] Sent message_stop event")
-	} else {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Write([]byte(responseData))
-		log.Printf("[Handler] Sent non-streaming response, length: %d bytes", len(responseData))
-	}
 
 	atomic.AddInt64(&h.successRequests, 1)
 	log.Printf("[Handler] Request completed successfully")

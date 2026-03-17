@@ -58,17 +58,10 @@ func CallFireworksAPI(apiKey, baseURL string, reqBody []byte, callback *Firework
 		}
 	}
 
-	// Fireworks constraint: max_tokens > 4096 requires stream=true
-	maxTokens := 0
-	if mt, ok := req["max_tokens"].(float64); ok {
-		maxTokens = int(mt)
-	}
-	isStream := req["stream"] == true
-
-	if maxTokens > 4096 && !isStream {
-		log.Printf("[Fireworks] max_tokens=%d > 4096 but stream=false, forcing stream=true", maxTokens)
-		req["stream"] = true
-	}
+	// Always force streaming mode
+	originalStream := req["stream"]
+	req["stream"] = true
+	log.Printf("[Fireworks] Forcing stream=true (original: %v)", originalStream)
 
 	filteredBody, _ := json.Marshal(req)
 	log.Printf("[Fireworks] Filtered request body length: %d bytes", len(filteredBody))
@@ -124,124 +117,71 @@ func CallFireworksAPI(apiKey, baseURL string, reqBody []byte, callback *Firework
 		return fmt.Errorf("fireworks API error %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Check final stream value (may have been forced to true)
-	finalStream := req["stream"] == true
-	log.Printf("[Fireworks] Stream mode: %v", finalStream)
-
-	if finalStream {
-		return parseAnthropicSSE(resp.Body, callback)
-	}
-
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Printf("[Fireworks] Failed to decode response: %v", err)
-		return fmt.Errorf("decode response: %w", err)
-	}
-
-	log.Printf("[Fireworks] Non-streaming response received, type: %v", result["type"])
-
-	resultJSON, _ := json.Marshal(result)
-	if callback.OnChunk != nil {
-		callback.OnChunk(string(resultJSON))
-	}
-
-	if callback.OnComplete != nil {
-		if usage, ok := result["usage"].(map[string]interface{}); ok {
-			inputTokens := int64(usage["input_tokens"].(float64))
-			outputTokens := int64(usage["output_tokens"].(float64))
-			log.Printf("[Fireworks] Token usage - input: %d, output: %d", inputTokens, outputTokens)
-			callback.OnComplete(inputTokens, outputTokens)
-		}
-	}
-	return nil
+	// Always use streaming mode
+	log.Printf("[Fireworks] Processing streaming response")
+	return parseAnthropicSSE(resp.Body, callback)
 }
 
 func parseAnthropicSSE(body io.Reader, callback *FireworksCallback) error {
 	log.Printf("[Fireworks] Starting SSE parsing")
 
-	// Read all body first to log it
-	bodyBytes, err := io.ReadAll(body)
-	if err != nil {
-		log.Printf("[Fireworks] Failed to read SSE body: %v", err)
-		return err
-	}
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 64*1024), 50*1024*1024) // 50MB max buffer
 
-	log.Printf("[Fireworks] SSE body length: %d bytes", len(bodyBytes))
-	if len(bodyBytes) > 0 {
-		if len(bodyBytes) > 2000 {
-			log.Printf("[Fireworks] SSE body preview: %s...", string(bodyBytes[:2000]))
-		} else {
-			log.Printf("[Fireworks] SSE body: %s", string(bodyBytes))
-		}
-	} else {
-		log.Printf("[Fireworks] SSE body is EMPTY!")
-	}
-
-	scanner := bufio.NewScanner(bytes.NewReader(bodyBytes))
 	var inputTokens, outputTokens int64
 	eventCount := 0
-	var currentEventType string
-	var currentData string
+	var sseBuffer strings.Builder
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line := scanner.Text()
 
-		// Skip empty lines
-		if line == "" {
-			// Process accumulated event
-			if currentData != "" {
-				eventCount++
-				var event map[string]interface{}
-				if err := json.Unmarshal([]byte(currentData), &event); err == nil {
-					eventType := event["type"]
-					if eventCount <= 5 || eventType == "message_delta" || eventType == "message_stop" {
-						log.Printf("[Fireworks] SSE event #%d type: %v (event: %s)", eventCount, eventType, currentEventType)
-					}
+		// Forward raw line to callback
+		if callback.OnChunk != nil {
+			sseBuffer.WriteString(line)
+			sseBuffer.WriteString("\n")
 
-					// Extract token usage
-					if event["type"] == "message_delta" {
-						if usage, ok := event["usage"].(map[string]interface{}); ok {
-							if ot, ok := usage["output_tokens"].(float64); ok {
-								outputTokens = int64(ot)
-								log.Printf("[Fireworks] Updated output_tokens: %d", outputTokens)
-							}
+			// On empty line, flush accumulated SSE event
+			if strings.TrimSpace(line) == "" && sseBuffer.Len() > 1 {
+				if err := callback.OnChunk(sseBuffer.String()); err != nil {
+					log.Printf("[Fireworks] OnChunk callback error: %v", err)
+					return err
+				}
+				sseBuffer.Reset()
+			}
+		}
+
+		// Parse for token tracking (keep existing logic)
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "data:") {
+			eventCount++
+			dataJSON := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+
+			var event map[string]interface{}
+			if err := json.Unmarshal([]byte(dataJSON), &event); err == nil {
+				eventType := event["type"]
+				if eventCount <= 5 || eventType == "message_delta" || eventType == "message_stop" {
+					log.Printf("[Fireworks] SSE event #%d type: %v", eventCount, eventType)
+				}
+
+				// Extract token usage
+				if event["type"] == "message_delta" {
+					if usage, ok := event["usage"].(map[string]interface{}); ok {
+						if ot, ok := usage["output_tokens"].(float64); ok {
+							outputTokens = int64(ot)
+							log.Printf("[Fireworks] Updated output_tokens: %d", outputTokens)
 						}
-					} else if event["type"] == "message_start" {
-						if msg, ok := event["message"].(map[string]interface{}); ok {
-							if usage, ok := msg["usage"].(map[string]interface{}); ok {
-								if it, ok := usage["input_tokens"].(float64); ok {
-									inputTokens = int64(it)
-									log.Printf("[Fireworks] Got input_tokens: %d", inputTokens)
-								}
-							}
-						}
 					}
-
-					// Send to callback
-					if callback.OnChunk != nil {
-						dataJSON, _ := json.Marshal(event)
-						if err := callback.OnChunk(string(dataJSON)); err != nil {
-							log.Printf("[Fireworks] OnChunk callback error: %v", err)
-							return err
+				} else if event["type"] == "message_start" {
+					if msg, ok := event["message"].(map[string]interface{}); ok {
+						if usage, ok := msg["usage"].(map[string]interface{}); ok {
+							if it, ok := usage["input_tokens"].(float64); ok {
+								inputTokens = int64(it)
+								log.Printf("[Fireworks] Got input_tokens: %d", inputTokens)
+							}
 						}
 					}
 				}
-				currentData = ""
-				currentEventType = ""
 			}
-			continue
-		}
-
-		// Parse event type line
-		if strings.HasPrefix(line, "event:") {
-			currentEventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-
-		// Parse data line
-		if strings.HasPrefix(line, "data:") {
-			currentData = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			continue
 		}
 	}
 
