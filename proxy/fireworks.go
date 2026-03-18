@@ -46,8 +46,8 @@ func convertToUSD(units string, nanos int32) float64 {
 	return float64(unitsInt) + float64(nanos)/1e9
 }
 
-func CallFireworksAPI(key *config.FireworksKey, baseURL string, reqBody []byte, callback *FireworksCallback) error {
-	log.Printf("[Fireworks] Starting API call to %s with key %s", baseURL, key.ID)
+func CallFireworksAPI(key *config.FireworksKey, baseURL string, reqBody []byte, callback *FireworksCallback, sessionID string) error {
+	log.Printf("[Fireworks] Starting API call to %s with key %s, session: %s", baseURL, key.ID, sessionID)
 
 	apiKey := key.Key
 
@@ -120,6 +120,12 @@ func CallFireworksAPI(key *config.FireworksKey, baseURL string, reqBody []byte, 
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
+
+	// Add session affinity header for prompt caching
+	if sessionID != "" {
+		httpReq.Header.Set("x-session-affinity", sessionID)
+		log.Printf("[Fireworks] Set x-session-affinity header: %s", sessionID)
+	}
 
 	resp, err := fireworksHttpClient.Do(httpReq)
 	if err != nil {
