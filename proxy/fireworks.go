@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"kiro-api-proxy/config"
 	"log"
 	"net/http"
 	"strings"
@@ -25,8 +26,8 @@ var fireworksHttpClient = &http.Client{
 
 type FireworksCallback struct {
 	OnChunk    func(chunk string) error
-	OnComplete func(inputTokens, outputTokens int64) error
-	OnError    func(err error)
+	OnComplete func(inputTokens, outputTokens, cacheReadTokens int64, keyID string) error
+	OnError    func(err error, statusCode int, keyID string)
 }
 
 type FireworksBillingResponse struct {
@@ -45,8 +46,10 @@ func convertToUSD(units string, nanos int32) float64 {
 	return float64(unitsInt) + float64(nanos)/1e9
 }
 
-func CallFireworksAPI(apiKey, baseURL string, reqBody []byte, callback *FireworksCallback) error {
-	log.Printf("[Fireworks] Starting API call to %s", baseURL)
+func CallFireworksAPI(key *config.FireworksKey, baseURL string, reqBody []byte, callback *FireworksCallback) error {
+	log.Printf("[Fireworks] Starting API call to %s with key %s", baseURL, key.ID)
+
+	apiKey := key.Key
 
 	// Filter unsupported parameters
 	var req map[string]interface{}
@@ -130,21 +133,24 @@ func CallFireworksAPI(apiKey, baseURL string, reqBody []byte, callback *Firework
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		log.Printf("[Fireworks] API error response: %s", string(body))
+		if callback.OnError != nil {
+			callback.OnError(fmt.Errorf("fireworks API error %d: %s", resp.StatusCode, string(body)), resp.StatusCode, key.ID)
+		}
 		return fmt.Errorf("fireworks API error %d: %s", resp.StatusCode, string(body))
 	}
 
 	// Always use streaming mode
-	log.Printf("[Fireworks] Processing streaming response")
-	return parseAnthropicSSE(resp.Body, callback)
+	log.Printf("[Fireworks] Processing streaming response for key %s", key.ID)
+	return parseAnthropicSSE(resp.Body, callback, key.ID)
 }
 
-func parseAnthropicSSE(body io.Reader, callback *FireworksCallback) error {
-	log.Printf("[Fireworks] Starting SSE parsing")
+func parseAnthropicSSE(body io.Reader, callback *FireworksCallback, keyID string) error {
+	log.Printf("[Fireworks] Starting SSE parsing for key %s", keyID)
 
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 50*1024*1024) // 50MB max buffer
 
-	var inputTokens, outputTokens int64
+	var inputTokens, outputTokens, cacheReadTokens int64
 	eventCount := 0
 	var sseBuffer strings.Builder
 
@@ -179,40 +185,51 @@ func parseAnthropicSSE(body io.Reader, callback *FireworksCallback) error {
 					log.Printf("[Fireworks] SSE event #%d type: %v", eventCount, eventType)
 				}
 
-				// Extract token usage
+				// Extract token usage - ONLY from message_delta (has actual values)
 				if event["type"] == "message_delta" {
 					if usage, ok := event["usage"].(map[string]interface{}); ok {
+						// Log full usage object for debugging
+						usageJSON, _ := json.Marshal(usage)
+						log.Printf("[Fireworks] Full usage from message_delta: %s", string(usageJSON))
+
+						// Get input_tokens (actual value, not placeholder)
+						if it, ok := usage["input_tokens"].(float64); ok && it > 0 {
+							inputTokens = int64(it)
+							log.Printf("[Fireworks] Got input_tokens: %d", inputTokens)
+						}
+
+						// Get output_tokens
 						if ot, ok := usage["output_tokens"].(float64); ok {
 							outputTokens = int64(ot)
-							log.Printf("[Fireworks] Updated output_tokens: %d", outputTokens)
+							log.Printf("[Fireworks] Got output_tokens: %d", outputTokens)
 						}
-					}
-				} else if event["type"] == "message_start" {
-					if msg, ok := event["message"].(map[string]interface{}); ok {
-						if usage, ok := msg["usage"].(map[string]interface{}); ok {
-							if it, ok := usage["input_tokens"].(float64); ok {
-								inputTokens = int64(it)
-								log.Printf("[Fireworks] Got input_tokens: %d", inputTokens)
-							}
+
+						// Get cache_read_input_tokens
+						if crt, ok := usage["cache_read_input_tokens"].(float64); ok {
+							cacheReadTokens = int64(crt)
+							log.Printf("[Fireworks] Got cache_read_input_tokens: %d", cacheReadTokens)
 						}
 					}
 				}
+				// message_start only has placeholder (0 tokens), skip it
+				// All actual usage comes from message_delta
 			}
 		}
 	}
 
-	log.Printf("[Fireworks] SSE parsing complete. Total events: %d, input_tokens: %d, output_tokens: %d", eventCount, inputTokens, outputTokens)
+	log.Printf("[Fireworks] SSE parsing complete for key %s. Total events: %d, input_tokens: %d, output_tokens: %d, cache_read_tokens: %d", keyID, eventCount, inputTokens, outputTokens, cacheReadTokens)
 
 	if err := scanner.Err(); err != nil {
 		log.Printf("[Fireworks] Scanner error: %v", err)
 		if callback.OnError != nil {
-			callback.OnError(err)
+			callback.OnError(err, 0, keyID)
 		}
 		return err
 	}
 
 	if callback.OnComplete != nil {
-		callback.OnComplete(inputTokens, outputTokens)
+		log.Printf("[Fireworks] Calling OnComplete with final usage - input: %d, output: %d, cache_read: %d", inputTokens, outputTokens, cacheReadTokens)
+		callback.OnComplete(inputTokens, outputTokens, cacheReadTokens, keyID)
 	}
 
 	return nil

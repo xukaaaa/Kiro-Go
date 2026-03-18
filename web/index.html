@@ -1042,34 +1042,31 @@
             </div>
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title" data-i18n="settings.fireworksSettings"></span>
+                    <span class="card-title">Fireworks Keys</span>
                     <div style="display:flex;align-items:center;gap:8px">
-                        <span id="fireworksUsage" class="usage-display"></span>
-                        <button class="btn btn-sm" onclick="updateFireworksUsage()" title="Refresh usage" style="padding:4px 8px;font-size:12px">🔄</button>
+                        <select id="fireworksPolicy" style="padding:4px 8px;font-size:12px;border:1px solid #e2e8f0;border-radius:4px">
+                            <option value="round-robin">Round Robin</option>
+                            <option value="weighted">Weighted</option>
+                        </select>
+                        <button class="btn btn-sm" onclick="loadFireworksKeys()" title="Refresh keys" style="padding:4px 8px;font-size:12px">🔄</button>
                     </div>
                 </div>
-                <div class="form-group">
-                    <label style="display:flex;align-items:center;gap:10px">
-                        <label class="switch"><input type="checkbox" id="fireworksEnabled"><span class="slider"></span></label>
-                        <span data-i18n="settings.enableFireworks"></span>
-                    </label>
+                <div id="fireworksKeysList" style="margin-bottom:12px"></div>
+                <div style="border-top:1px solid #e2e8f0;padding-top:12px">
+                    <div style="font-size:13px;font-weight:600;margin-bottom:8px">Add New Key</div>
+                    <div style="display:grid;grid-template-columns:1fr;gap:8px;margin-bottom:8px">
+                        <input type="text" id="newFwKeyValue" placeholder="fw_xxxxx (API Key)" style="font-size:13px">
+                    </div>
+                    <div style="display:grid;grid-template-columns:2fr 1fr auto;gap:8px">
+                        <input type="text" id="newFwAccountId" placeholder="Account ID" style="font-size:13px">
+                        <input type="number" id="newFwWeight" placeholder="Weight" value="1" min="1" style="font-size:13px">
+                        <button class="btn btn-primary" onclick="addFireworksKey()" style="font-size:13px;padding:6px 12px">Add</button>
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label>Fireworks API Key</label>
-                    <input type="text" id="fireworksApiKey" placeholder="fw_xxxxx">
-                </div>
-                <div class="form-group">
-                    <label>Fireworks Account ID</label>
-                    <input type="text" id="fireworksAccountId" placeholder="resource-xxxxx">
-                </div>
-                <div class="form-group">
-                    <label>Fireworks Base URL</label>
-                    <input type="text" id="fireworksBaseUrl" placeholder="https://api.fireworks.ai/inference/v1">
-                </div>
-                <button class="btn btn-primary" onclick="saveFireworksConfig()" data-i18n="settings.saveFireworks"></button>
             </div>
             <div class="card">
-                <div class="card-header"><span class="card-title" data-i18n="settings.adminPassword"></span></div>
+                <div class="card-header">
+                    <span class="card-title" data-i18n="settings.adminPassword"></span></div>
                 <div class="form-group"><label data-i18n="settings.newPassword"></label><input type="password"
                         id="newPassword" data-i18n-placeholder="settings.newPasswordPlaceholder"></div>
                 <button class="btn btn-primary" onclick="changePassword()" data-i18n="settings.changePassword"></button>
@@ -2167,6 +2164,102 @@
                 console.error('Failed to fetch Fireworks usage:', err);
             }
         }
+        async function loadFireworksKeys() {
+            try {
+                const res = await fetch('/admin/api/fireworks/keys', { headers: { 'X-Admin-Password': password } });
+                const keys = await res.json();
+                const container = document.getElementById('fireworksKeysList');
+                if (keys.length === 0) {
+                    container.innerHTML = '<div style="color:#64748b;font-size:13px;padding:8px">No keys configured. Add one below.</div>';
+                    return;
+                }
+                container.innerHTML = keys.map(k => {
+                    const statusColor = k.status === 'active' ? '#22c55e' : k.status === 'cooldown' ? '#f59e0b' : k.status === 'cost_limited' ? '#ef4444' : '#94a3b8';
+                    const statusLabel = k.status === 'active' ? 'active' : k.status === 'cooldown' ? 'cooldown' : k.status === 'cost_limited' ? 'cost limited' : 'disabled';
+                    const cooldownDisplay = k.cooldownUntil > 0 ? new Date(k.cooldownUntil * 1000).toLocaleTimeString() : '-';
+                    const delta = k.estimatedCost - k.actualUsageCost;
+                    const deltaColor = delta > 0 ? '#ef4444' : delta < 0 ? '#22c55e' : '#64748b';
+                    const costThreshold = 5.0;
+                    const thresholdPct = (k.estimatedCost / costThreshold * 100).toFixed(0);
+                    const thresholdColor = k.estimatedCost >= costThreshold ? '#ef4444' : k.estimatedCost >= costThreshold * 0.8 ? '#f59e0b' : '#22c55e';
+                    return `<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;margin-bottom:8px">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                            <div style="font-weight:600;font-size:14px">
+                                <span style="color:${statusColor}">●</span> ${k.id}
+                                <span style="color:#64748b;font-weight:400;font-size:12px;margin-left:8px">${k.key}</span>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:8px">
+                                <div style="font-size:12px;color:#64748b">
+                                    <span>acc: ${k.accountId}</span>
+                                    <span style="margin-left:12px">weight: ${k.weight}</span>
+                                </div>
+                                <button onclick="deleteFireworksKey('${k.id}')" style="padding:4px 8px;font-size:11px;background:#fee2e2;color:#dc2626;border:none;border-radius:4px;cursor:pointer">Delete</button>
+                            </div>
+                        </div>
+                        <div style="font-size:12px;color:#64748b;margin-bottom:6px">
+                            Status: ${statusLabel} | Err: ${k.errorCount} | Cooldown: ${cooldownDisplay}
+                            <span style="margin-left:12px;color:${thresholdColor}">threshold: ${thresholdPct}%</span>
+                        </div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;background:#fff;padding:8px;border-radius:4px">
+                            <div>
+                                <div style="color:#94a3b8;font-size:10px;margin-bottom:2px">ESTIMATED</div>
+                                <div>In: ${k.estimatedInputTokens} | Cache: ${k.estimatedCacheReadTokens || 0}</div>
+                                <div>Out: ${k.estimatedOutputTokens} | Cost: $${k.estimatedCost.toFixed(4)}</div>
+                                <div style="color:${deltaColor}">Delta: $${delta.toFixed(4)}</div>
+                            </div>
+                            <div>
+                                <div style="color:#94a3b8;font-size:10px;margin-bottom:2px">ACTUAL (API)</div>
+                                <div>Cost: $${k.actualUsageCost.toFixed(2)}</div>
+                                <div>Last Check: ${k.lastBillingCheck > 0 ? new Date(k.lastBillingCheck * 1000).toLocaleString() : '-'}</div>
+                            </div>
+                        </div>
+                    </div>`;
+                }).join('');
+            } catch (err) {
+                console.error('Failed to load Fireworks keys:', err);
+            }
+        }
+        async function addFireworksKey() {
+            const key = document.getElementById('newFwKeyValue').value.trim();
+            const accountId = document.getElementById('newFwAccountId').value.trim();
+            const weight = parseInt(document.getElementById('newFwWeight').value) || 1;
+            if (!key || !accountId) {
+                return alert('Please fill in Key and Account ID');
+            }
+            try {
+                const res = await fetch('/admin/api/fireworks/keys', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ key, accountId, weight })
+                });
+                const d = await res.json();
+                if (d.success) {
+                    document.getElementById('newFwKeyValue').value = '';
+                    document.getElementById('newFwAccountId').value = '';
+                    loadFireworksKeys();
+                } else {
+                    alert('Failed to add key: ' + d.error);
+                }
+            } catch (err) {
+                alert('Error: ' + err.message);
+            }
+        }
+        async function deleteFireworksKey(keyId) {
+            if (!confirm('Delete key ' + keyId + '?')) return;
+            try {
+                const res = await fetch('/admin/api/fireworks/keys/' + keyId, {
+                    method: 'DELETE', headers: { 'X-Admin-Password': password }
+                });
+                const d = await res.json();
+                if (d.success) {
+                    loadFireworksKeys();
+                } else {
+                    alert('Failed to delete key: ' + d.error);
+                }
+            } catch (err) {
+                alert('Error: ' + err.message);
+            }
+        }
+        loadFireworksKeys();
         setInterval(updateFireworksUsage, 60000);
         function generateApiKey() {
             const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
