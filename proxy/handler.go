@@ -310,6 +310,20 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("gpt-4", "kiro-proxy", true),
 	)
 
+	// 添加 Fireworks 模型 (cross-provider routing)
+	// kimi 支持 image，其他只支持 text
+	fireworksModels := []struct {
+		id            string
+		supportsImage bool
+	}{
+		{"accounts/fireworks/models/minimax-m2p5", false},
+		{"accounts/fireworks/models/glm-5", false},
+		{"accounts/fireworks/models/kimi-k2p5", true},
+	}
+	for _, m := range fireworksModels {
+		models = append(models, buildModelInfo(m.id, "fireworks", m.supportsImage))
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
@@ -439,7 +453,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Check if this is a Fireworks model
+	// 解析模型和 thinking 模式 (包括 config mapping)
+	thinkingCfg := config.GetThinkingConfig()
+	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	req.Model = actualModel
+
+	// Check if this is a Fireworks model (after mapping)
 	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
 		h.handleFireworksRequest(w, body)
 		return
@@ -458,10 +477,6 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 解析模型和 thinking 模式
-	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	req.Model = actualModel
 	estimatedInputTokens := estimateClaudeRequestInputTokens(&req)
 
 	// 转换请求
@@ -1067,7 +1082,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this is a Fireworks model
+	// 解析模型和 thinking 模式 (包括 config mapping)
+	thinkingCfg := config.GetThinkingConfig()
+	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	req.Model = actualModel
+
+	// Check if this is a Fireworks model (after mapping)
 	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
 		h.handleFireworksRequest(w, body)
 		return
@@ -1084,10 +1104,6 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 解析模型和 thinking 模式
-	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
@@ -1750,6 +1766,12 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpdateFireworksConfig(w, r)
 	case path == "/fireworks/usage" && r.Method == "GET":
 		h.apiGetFireworksUsage(w, r)
+	case path == "/model-mappings" && r.Method == "GET":
+		h.apiGetModelMappings(w, r)
+	case path == "/model-mappings" && r.Method == "POST":
+		h.apiSetModelMapping(w, r)
+	case strings.HasPrefix(path, "/model-mappings") && r.Method == "DELETE":
+		h.apiDeleteModelMapping(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -2789,6 +2811,82 @@ func (h *Handler) apiGetFireworksUsage(w http.ResponseWriter, r *http.Request) {
 		"warningThreshold": 5.0,
 		"limit":            6.0,
 		"showWarning":      usageCost >= 5.0,
+	})
+}
+
+// apiGetModelMappings returns all model mappings
+func (h *Handler) apiGetModelMappings(w http.ResponseWriter, r *http.Request) {
+	mappings := config.GetModelMappingsList()
+	json.NewEncoder(w).Encode(mappings)
+}
+
+// apiSetModelMapping adds or updates a model mapping
+func (h *Handler) apiSetModelMapping(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Source      string `json:"source"`
+		Target      string `json:"target"`
+		Description string `json:"description,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	if req.Source == "" || req.Target == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "source and target are required"})
+		return
+	}
+
+	if err := config.SetModelMapping(req.Source, req.Target); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"source":  req.Source,
+		"target":  req.Target,
+	})
+}
+
+// apiDeleteModelMapping removes a model mapping
+func (h *Handler) apiDeleteModelMapping(w http.ResponseWriter, r *http.Request) {
+	// Extract model name from query parameter or path
+	model := r.URL.Query().Get("model")
+	if model == "" {
+		// Try to extract from path: /model-mappings/{model}
+		path := strings.TrimPrefix(r.URL.Path, "/admin/api/model-mappings/")
+		if path != r.URL.Path && path != "" {
+			model = path
+		}
+	}
+
+	if model == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "model parameter is required"})
+		return
+	}
+
+	deleted, err := config.DeleteModelMapping(model)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	if !deleted {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "mapping not found"})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"model":   model,
 	})
 }
 

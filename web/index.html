@@ -924,6 +924,7 @@
         </div>
         <div class="tabs">
             <div class="tab active" data-tab="accounts" data-i18n="tabs.accounts"></div>
+            <div class="tab" data-tab="mappings" data-i18n="tabs.mappings"></div>
             <div class="tab" data-tab="settings" data-i18n="tabs.settings"></div>
             <div class="tab" data-tab="api" data-i18n="tabs.api"></div>
         </div>
@@ -964,6 +965,16 @@
                     </div>
                 </div>
                 <div id="accountsList"></div>
+            </div>
+        </div>
+        <div id="tabMappings" class="tab-content hidden">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title" data-i18n="mappings.title"></span>
+                </div>
+                <div id="mappingsList" style="padding:20px">
+                    <div style="text-align:center;color:#64748b;padding:20px" data-i18n="common.loading"></div>
+                </div>
             </div>
         </div>
         <div id="tabSettings" class="tab-content hidden">
@@ -1132,6 +1143,15 @@
                 'tabs.accounts': '账号',
                 'tabs.settings': '设置',
                 'tabs.api': 'API',
+                'tabs.mappings': '映射',
+                'mappings.title': '模型映射',
+                'mappings.refreshModels': '刷新模型列表',
+                'mappings.sourceModel': '源模型',
+                'mappings.targetModel': '目标模型',
+                'mappings.save': '保存',
+                'mappings.saved': '已保存',
+                'mappings.saveError': '保存失败',
+                'mappings.modelsLoadError': '加载模型列表失败',
                 'accounts.title': '账号列表',
                 'accounts.add': '添加账号',
                 'accounts.empty': '暂无账号',
@@ -1348,6 +1368,15 @@
                 'tabs.accounts': 'Accounts',
                 'tabs.settings': 'Settings',
                 'tabs.api': 'API',
+                'tabs.mappings': 'Mappings',
+                'mappings.title': 'Model Mappings',
+                'mappings.refreshModels': 'Refresh Models',
+                'mappings.sourceModel': 'Source Model',
+                'mappings.targetModel': 'Target Model',
+                'mappings.save': 'Save',
+                'mappings.saved': 'Saved',
+                'mappings.saveError': 'Failed to save',
+                'mappings.modelsLoadError': 'Failed to load models',
                 'accounts.title': 'Account List',
                 'accounts.add': 'Add Account',
                 'accounts.empty': 'No accounts',
@@ -2177,6 +2206,10 @@
             document.querySelectorAll('.tab').forEach(tabEl => tabEl.classList.toggle('active', tabEl.dataset.tab === tab));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
             document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+            // Load mappings tab data when switching to it
+            if (tab === 'mappings') {
+                renderMappingsTab();
+            }
         }
         async function toggleAccount(id, enabled) {
             await fetch('/admin/api/accounts/' + id, {
@@ -2644,6 +2677,145 @@
                 });
             } catch (e) { }
             loadAccounts();
+        }
+
+        // ==================== Model Mappings ====================
+        let availableModels = [];
+        let currentMappings = {};
+
+        // Fixed source models for mapping configuration
+        const FIXED_SOURCE_MODELS = [
+            { id: 'claude-opus-4-6', label: 'Claude Opus 4.6' },
+            { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
+            { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5' }
+        ];
+
+        async function loadAvailableModels() {
+            try {
+                const res = await fetch('/v1/models');
+                if (!res.ok) throw new Error('Failed to load models');
+                const data = await res.json();
+                availableModels = (data.data || []).map(m => m.id).sort();
+                return availableModels;
+            } catch (e) {
+                console.error('Failed to load available models:', e);
+                return [];
+            }
+        }
+
+        async function loadModelMappings() {
+            try {
+                const res = await fetch('/admin/api/model-mappings', {
+                    headers: { 'X-Admin-Password': password }
+                });
+                if (!res.ok) throw new Error('Failed to load mappings');
+                const data = await res.json();
+                currentMappings = {};
+                (data || []).forEach(m => {
+                    currentMappings[m.source] = m.target;
+                });
+                return currentMappings;
+            } catch (e) {
+                console.error('Failed to load model mappings:', e);
+                return {};
+            }
+        }
+
+        async function renderMappingsTab() {
+            const container = document.getElementById('mappingsList');
+
+            // Load data in parallel
+            const [models, mappings] = await Promise.all([
+                loadAvailableModels(),
+                loadModelMappings()
+            ]);
+
+            if (models.length === 0) {
+                container.innerHTML = '<div style="text-align:center;color:#ef4444;padding:20px">' + t('mappings.modelsLoadError') + '</div>';
+                return;
+            }
+
+            // Build select options HTML
+            const buildSelectOptions = (selectedValue) => {
+                return models.map(m =>
+                    '<option value="' + m + '"' + (m === selectedValue ? ' selected' : '') + '>' + m + '</option>'
+                ).join('');
+            };
+
+            // Render each source model row
+            const rows = FIXED_SOURCE_MODELS.map(source => {
+                const currentTarget = currentMappings[source.id] || '';
+                return '<div class="mapping-row" style="display:flex;align-items:center;gap:16px;padding:16px;border-bottom:1px solid #e2e8f0">' +
+                    '<div style="min-width:220px">' +
+                        '<div style="font-weight:500;color:#1f2937">' + source.label + '</div>' +
+                        '<div style="font-size:12px;color:#64748b;font-family:monospace">' + source.id + '</div>' +
+                    '</div>' +
+                    '<div style="display:flex;align-items:center;gap:8px;color:#64748b">' +
+                        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14m-7-7l7 7-7 7"/></svg>' +
+                    '</div>' +
+                    '<select id="mapping-' + source.id + '" style="flex:1;max-width:400px;padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:14px;background:#fff;cursor:pointer">' +
+                        '<option value="">-- ' + t('mappings.targetModel') + ' --</option>' +
+                        buildSelectOptions(currentTarget) +
+                    '</select>' +
+                    (currentTarget ? '<span class="mapping-status" style="font-size:12px;color:#10b981"><code style="background:#d1fae5;padding:2px 6px;border-radius:4px">' + currentTarget + '</code></span>' : '<span style="font-size:12px;color:#f59e0b">not set</span>') +
+                '</div>';
+            }).join('');
+
+            container.innerHTML = rows +
+                '<div style="padding:16px;display:flex;justify-content:flex-end;gap:12px">' +
+                    '<button class="btn btn-secondary" onclick="refreshModelsList()">' + t('mappings.refreshModels') + '</button>' +
+                    '<button class="btn btn-primary" onclick="saveAllMappings()">' + t('mappings.save') + '</button>' +
+                '</div>' +
+                '<div style="padding:16px;font-size:12px;color:#64748b">' +
+                    '<strong>Note:</strong> Config mappings have the highest priority and override hardcoded mappings. ' +
+                    'Models prefixed with <code>accounts/fireworks/models/</code> will route to Fireworks provider.' +
+                '</div>';
+        }
+
+        async function saveAllMappings() {
+            let hasChanges = false;
+            const promises = [];
+
+            for (const source of FIXED_SOURCE_MODELS) {
+                const select = document.getElementById('mapping-' + source.id);
+                const target = select.value;
+                const currentTarget = currentMappings[source.id] || '';
+
+                if (target !== currentTarget) {
+                    hasChanges = true;
+                    promises.push(
+                        fetch('/admin/api/model-mappings', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Admin-Password': password
+                            },
+                            body: JSON.stringify({ source: source.id, target })
+                        }).then(res => {
+                            if (!res.ok) return res.json().then(err => { throw new Error(err.error || 'Failed to save'); });
+                        })
+                    );
+                }
+            }
+
+            if (!hasChanges) {
+                alert('No changes to save');
+                return;
+            }
+
+            try {
+                await Promise.all(promises);
+                // Reload mappings and re-render
+                await loadModelMappings();
+                await renderMappingsTab();
+            } catch (e) {
+                alert(t('mappings.saveError') + ': ' + e.message);
+            }
+        }
+
+        async function refreshModelsList() {
+            availableModels = [];
+            await renderMappingsTab();
         }
     </script>
 </body>
