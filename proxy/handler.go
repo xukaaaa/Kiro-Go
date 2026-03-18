@@ -9,6 +9,7 @@ import (
 	"kiro-api-proxy/pool"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -466,7 +467,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 			h.sendClaudeError(w, 400, "invalid_request_error", "Failed to update request body")
 			return
 		}
-		h.handleFireworksRequest(w, updatedBody)
+		h.handleFireworksRequest(w, updatedBody, req.Model)
 		return
 	}
 
@@ -947,9 +948,10 @@ func (h *Handler) refreshFireworksUsage() {
 				log.Printf("[Fireworks] Failed to fetch usage: %v", err)
 				continue
 			}
-
-			config.UpdateFireworksUsage(usage, time.Now().Unix())
-			log.Printf("[Fireworks] Usage updated: $%.2f", usage)
+			// TODO: Update per-key usage after implementing pool
+			// config.UpdateFireworksUsage(keyID, usage, time.Now().Unix())
+			_ = usage // suppress unused variable warning
+			log.Printf("[Fireworks] Usage fetched but not saved (multi-key support pending): $%.2f", usage)
 
 		case <-h.stopRefresh:
 			return
@@ -1101,7 +1103,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to update request body")
 			return
 		}
-		h.handleFireworksRequest(w, updatedBody)
+		h.handleFireworksRequest(w, updatedBody, req.Model)
 		return
 	}
 
@@ -1591,8 +1593,8 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 
 // ==================== Fireworks Provider ====================
 
-func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) {
-	log.Printf("[Handler] Fireworks request received, body length: %d bytes", len(reqBody))
+func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte, model string) {
+	log.Printf("[Handler] Fireworks request received, body length: %d bytes, model: %s", len(reqBody), model)
 
 	// Parse and log request with truncated text fields
 	var reqMap map[string]interface{}
@@ -1631,7 +1633,7 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) 
 	}
 
 	fwCfg := config.GetFireworksConfig()
-	log.Printf("[Handler] Fireworks config - enabled: %v, baseURL: %s", fwCfg.Enabled, fwCfg.BaseURL)
+	log.Printf("[Handler] Fireworks config - enabled: %v, baseURL: %s, keys: %d", fwCfg.Enabled, fwCfg.BaseURL, len(config.GetFireworksKeys()))
 
 	if !fwCfg.Enabled {
 		log.Printf("[Handler] Fireworks provider is disabled")
@@ -1639,11 +1641,17 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) 
 		return
 	}
 
-	if fwCfg.ApiKey == "" {
-		log.Printf("[Handler] Fireworks API key not configured")
-		h.sendOpenAIError(w, 503, "provider_not_configured", "Fireworks API key not configured")
+	// Get key from pool with rotation
+	pool := pool.GetFireworksKeyPool()
+	key := pool.GetNext()
+
+	if key == nil {
+		log.Printf("[Handler] No available Fireworks keys")
+		h.sendOpenAIError(w, 503, "no_available_keys", "No available Fireworks API keys (all cooldown, disabled, or over cost threshold)")
 		return
 	}
+
+	log.Printf("[Handler] Selected Fireworks key: %s (account: %s, status: %s)", key.ID, key.AccountID, pool.GetKeyStatus(*key))
 
 	atomic.AddInt64(&h.totalRequests, 1)
 
@@ -1653,6 +1661,7 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) 
 	log.Printf("[Handler] Request model: %v, client stream: %v (will always return streaming response)", req["model"], clientStream)
 
 	chunkCount := 0
+	var inputTokens, outputTokens int64
 
 	callback := &FireworksCallback{
 		OnChunk: func(chunk string) error {
@@ -1667,14 +1676,21 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) 
 			}
 			return nil
 		},
-		OnComplete: func(inputTokens, outputTokens int64) error {
-			log.Printf("[Handler] OnComplete called - input: %d, output: %d tokens", inputTokens, outputTokens)
-			atomic.AddInt64(&h.totalTokens, inputTokens+outputTokens)
+		OnComplete: func(it, ot, crt int64, keyID string) error {
+			inputTokens = it
+			outputTokens = ot
+			log.Printf("[Handler] OnComplete received for key %s - input: %d, output: %d, cache_read: %d, model: %s", keyID, it, ot, crt, model)
+			atomic.AddInt64(&h.totalTokens, it+ot)
+			// Update pool with usage (model-specific pricing)
+			pool.RecordSuccess(keyID)
+			pool.UpdateEstimatedUsage(keyID, it, ot, crt, model)
 			return nil
 		},
-		OnError: func(err error) {
-			log.Printf("[Handler] OnError called: %v", err)
+		OnError: func(err error, statusCode int, keyID string) {
+			log.Printf("[Handler] OnError called for key %s (status: %d): %v", keyID, statusCode, err)
 			atomic.AddInt64(&h.failedRequests, 1)
+			// Record error in pool for cooldown
+			pool.RecordError(keyID, statusCode)
 		},
 	}
 
@@ -1684,16 +1700,17 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte) 
 	w.Header().Set("Connection", "keep-alive")
 	log.Printf("[Handler] Set streaming headers")
 
-	log.Printf("[Handler] Calling Fireworks API...")
-	err := CallFireworksAPI(fwCfg.ApiKey, fwCfg.BaseURL, reqBody, callback)
+	log.Printf("[Handler] Calling Fireworks API with key %s...", key.ID)
+	err := CallFireworksAPI(key, fwCfg.BaseURL, reqBody, callback)
 	if err != nil {
 		log.Printf("[Handler] Fireworks API call failed: %v", err)
+		// Error already recorded in OnError callback
 		atomic.AddInt64(&h.failedRequests, 1)
 		h.sendOpenAIError(w, 500, "fireworks_error", err.Error())
 		return
 	}
 
-	log.Printf("[Handler] Fireworks API call completed successfully, total chunks: %d", chunkCount)
+	log.Printf("[Handler] Fireworks API call completed successfully with key %s, total chunks: %d, tokens: %d", key.ID, chunkCount, inputTokens+outputTokens)
 
 	atomic.AddInt64(&h.successRequests, 1)
 	log.Printf("[Handler] Request completed successfully")
@@ -1776,8 +1793,20 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetFireworksConfig(w, r)
 	case path == "/fireworks" && r.Method == "POST":
 		h.apiUpdateFireworksConfig(w, r)
+	case path == "/fireworks/keys" && r.Method == "GET":
+		h.apiGetFireworksKeys(w, r)
+	case path == "/fireworks/keys" && r.Method == "POST":
+		h.apiAddFireworksKey(w, r)
+	case strings.HasPrefix(path, "/fireworks/keys/") && r.Method == "PUT":
+		h.apiUpdateFireworksKey(w, r, strings.TrimPrefix(path, "/fireworks/keys/"))
+	case strings.HasPrefix(path, "/fireworks/keys/") && r.Method == "DELETE":
+		h.apiDeleteFireworksKey(w, r, strings.TrimPrefix(path, "/fireworks/keys/"))
+	case path == "/fireworks/keys/batch" && r.Method == "POST":
+		h.apiBatchFireworksKeys(w, r)
 	case path == "/fireworks/usage" && r.Method == "GET":
 		h.apiGetFireworksUsage(w, r)
+	case path == "/fireworks/sync-usage" && r.Method == "POST":
+		h.apiSyncFireworksUsage(w, r)
 	case path == "/model-mappings" && r.Method == "GET":
 		h.apiGetModelMappings(w, r)
 	case path == "/model-mappings" && r.Method == "POST":
@@ -2775,7 +2804,7 @@ func (h *Handler) apiUpdateFireworksConfig(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := config.UpdateFireworksConfig(req.Enabled, req.ApiKey, req.BaseUrl, req.AccountId); err != nil {
+	if err := config.UpdateFireworksConfig(req.Enabled, req.BaseUrl, "", 0); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -2789,8 +2818,10 @@ func (h *Handler) apiUpdateFireworksConfig(w http.ResponseWriter, r *http.Reques
 				log.Printf("[Fireworks] Failed to fetch usage after config update: %v", err)
 				return
 			}
-			config.UpdateFireworksUsage(usage, time.Now().Unix())
-			log.Printf("[Fireworks] Usage fetched after config update: $%.2f", usage)
+			// TODO: Update per-key usage after implementing pool
+			// config.UpdateFireworksUsage(keyID, usage, time.Now().Unix())
+			_ = usage
+			log.Printf("[Fireworks] Usage fetched after config update (multi-key pending): $%.2f", usage)
 		}()
 	}
 
@@ -2803,17 +2834,29 @@ func (h *Handler) apiGetFireworksUsage(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch real-time usage if enabled and configured
 	var usageCost float64
-	if cfg.Enabled && cfg.ApiKey != "" && cfg.AccountID != "" {
-		usage, err := FetchFireworksUsage(cfg.ApiKey, cfg.AccountID)
-		if err != nil {
-			log.Printf("[Fireworks] Failed to fetch usage: %v", err)
-			usageCost = cfg.UsageCost // fallback to cached value
-		} else {
-			usageCost = usage
-			config.UpdateFireworksUsage(usage, time.Now().Unix())
+	var totalActualCost float64
+	keys := config.GetFireworksKeys()
+
+	if cfg.Enabled && len(keys) > 0 {
+		for _, key := range keys {
+			if key.Key == "" || key.AccountID == "" {
+				continue
+			}
+			usage, err := FetchFireworksUsage(key.Key, key.AccountID)
+			if err != nil {
+				log.Printf("[Fireworks] Failed to fetch usage for key %s: %v", key.ID, err)
+				totalActualCost += key.ActualUsageCost // use cached
+			} else {
+				config.UpdateFireworksUsage(key.ID, usage, time.Now().Unix())
+				totalActualCost += usage
+			}
 		}
+		usageCost = totalActualCost
 	} else {
-		usageCost = cfg.UsageCost
+		// Fallback: sum from all keys
+		for _, key := range keys {
+			usageCost += key.ActualUsageCost
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2823,6 +2866,252 @@ func (h *Handler) apiGetFireworksUsage(w http.ResponseWriter, r *http.Request) {
 		"warningThreshold": 5.0,
 		"limit":            6.0,
 		"showWarning":      usageCost >= 5.0,
+	})
+}
+
+// apiGetFireworksKeys returns all Fireworks keys with status
+func (h *Handler) apiGetFireworksKeys(w http.ResponseWriter, r *http.Request) {
+	pool := pool.GetFireworksKeyPool()
+	keysWithStatus := pool.GetAllKeys()
+
+	result := make([]map[string]interface{}, len(keysWithStatus))
+	for i, kws := range keysWithStatus {
+		key := kws.Key
+		// Mask the actual API key
+		maskedKey := key.Key
+		if len(maskedKey) > 20 {
+			maskedKey = maskedKey[:10] + "..." + maskedKey[len(maskedKey)-4:]
+		} else if len(maskedKey) > 10 {
+			maskedKey = maskedKey[:10] + "..."
+		}
+
+		result[i] = map[string]interface{}{
+			"id":                        key.ID,
+			"name":                      key.Name,
+			"key":                       maskedKey,
+			"accountId":                 key.AccountID,
+			"weight":                    key.Weight,
+			"isActive":                  key.IsActive,
+			"status":                    kws.Status.String(),
+			"cooldownUntil":             key.CooldownUntil,
+			"errorCount":                key.ErrorCount,
+			"lastUsed":                  key.LastUsed,
+			"estimatedInputTokens":      key.EstimatedInputTokens,
+			"estimatedCacheReadTokens":  key.EstimatedCacheReadTokens,
+			"estimatedOutputTokens":     key.EstimatedOutputTokens,
+			"estimatedCost":             key.EstimatedCost,
+			"actualUsageCost":           key.ActualUsageCost,
+			"lastBillingCheck":          key.LastBillingCheck,
+			"usageDelta":                key.EstimatedCost - key.ActualUsageCost,
+		}
+	}
+
+	json.NewEncoder(w).Encode(result)
+}
+
+// apiAddFireworksKey adds a new Fireworks key
+func (h *Handler) apiAddFireworksKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID        string `json:"id"`
+		Key       string `json:"key"`
+		Name      string `json:"name"`
+		AccountID string `json:"accountId"`
+		Weight    int    `json:"weight"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// Auto-generate ID if not provided
+	if req.ID == "" {
+		req.ID = "fw-" + strconv.FormatInt(time.Now().Unix(), 10)
+	}
+
+	if req.Key == "" || req.AccountID == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "key and accountId are required"})
+		return
+	}
+
+	// Default weight to 1 if not specified
+	if req.Weight <= 0 {
+		req.Weight = 1
+	}
+
+	key := config.FireworksKey{
+		ID:        req.ID,
+		Key:       req.Key,
+		Name:      req.Name,
+		AccountID: req.AccountID,
+		Weight:    req.Weight,
+		IsActive:  true,
+	}
+
+	if err := config.AddFireworksKey(key); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Reload pool
+	pool.GetFireworksKeyPool().Reload()
+
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiUpdateFireworksKey updates an existing key
+func (h *Handler) apiUpdateFireworksKey(w http.ResponseWriter, r *http.Request, keyID string) {
+	var req struct {
+		Name      string `json:"name"`
+		Key       string `json:"key"`
+		AccountID string `json:"accountId"`
+		Weight    int    `json:"weight"`
+		IsActive  *bool  `json:"isActive,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	key := config.GetFireworksKey(keyID)
+	if key == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Key not found"})
+		return
+	}
+
+	if req.Name != "" {
+		key.Name = req.Name
+	}
+	if req.Key != "" {
+		key.Key = req.Key
+	}
+	if req.AccountID != "" {
+		key.AccountID = req.AccountID
+	}
+	if req.Weight > 0 {
+		key.Weight = req.Weight
+	}
+	if req.IsActive != nil {
+		key.IsActive = *req.IsActive
+	}
+
+	if err := config.UpdateFireworksKey(keyID, *key); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Reload pool
+	pool.GetFireworksKeyPool().Reload()
+
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiDeleteFireworksKey removes a key
+func (h *Handler) apiDeleteFireworksKey(w http.ResponseWriter, r *http.Request, keyID string) {
+	if err := config.DeleteFireworksKey(keyID); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Reload pool
+	pool.GetFireworksKeyPool().Reload()
+
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiBatchFireworksKeys handles batch operations on keys
+func (h *Handler) apiBatchFireworksKeys(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Action string   `json:"action"` // "enable", "disable", "delete"
+		IDs    []string `json:"ids"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	successCount := 0
+	for _, id := range req.IDs {
+		switch req.Action {
+		case "enable", "disable":
+			key := config.GetFireworksKey(id)
+			if key != nil {
+				key.IsActive = (req.Action == "enable")
+				if err := config.UpdateFireworksKey(id, *key); err == nil {
+					successCount++
+				}
+			}
+		case "delete":
+			if err := config.DeleteFireworksKey(id); err == nil {
+				successCount++
+			}
+		}
+	}
+
+	// Reload pool
+	pool.GetFireworksKeyPool().Reload()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":      true,
+		"processed":    len(req.IDs),
+		"succeeded":    successCount,
+	})
+}
+
+// apiSyncFireworksUsage triggers a sync of usage from billing API
+func (h *Handler) apiSyncFireworksUsage(w http.ResponseWriter, r *http.Request) {
+	keys := config.GetFireworksKeys()
+
+	var results []map[string]interface{}
+	now := time.Now().Unix()
+
+	for _, key := range keys {
+		if key.Key == "" || key.AccountID == "" {
+			continue
+		}
+
+		usage, err := FetchFireworksUsage(key.Key, key.AccountID)
+		result := map[string]interface{}{
+			"id":       key.ID,
+			"synced":   err == nil,
+			"usage":    usage,
+			"timestamp": now,
+		}
+		if err != nil {
+			result["error"] = err.Error()
+		}
+		results = append(results, result)
+
+		if err == nil {
+			config.UpdateFireworksUsage(key.ID, usage, now)
+		}
+	}
+
+	// Reload pool to update actual usage
+	pool.GetFireworksKeyPool().Reload()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"results":  results,
+		"totalCost": func() float64 {
+			total := 0.0
+			for _, r := range results {
+				if r["synced"].(bool) {
+					total += r["usage"].(float64)
+				}
+			}
+			return total
+		}(),
 	})
 }
 

@@ -91,14 +91,49 @@ type Account struct {
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
 }
 
-// FireworksConfig represents Fireworks AI provider configuration.
+// FireworksKey represents a single Fireworks API key with usage tracking and status.
+type FireworksKey struct {
+	// Identification
+	ID   string `json:"id"`   // Unique key identifier
+	Key  string `json:"key"`  // The actual API key (masked in responses)
+	Name string `json:"name"` // Display name for admin panel
+
+	// Account association (each key has its own account)
+	AccountID string `json:"accountId"` // Fireworks account ID for billing
+
+	// Routing configuration
+	Weight   int  `json:"weight"`   // Weight for weighted rotation (default: 1)
+	IsActive bool `json:"isActive"` // Whether key is active (not same as cooldown)
+
+	// Runtime status
+	CooldownUntil int64 `json:"cooldownUntil"` // Unix timestamp when cooldown ends
+	LastUsed      int64 `json:"lastUsed"`      // Last request timestamp
+	ErrorCount    int   `json:"errorCount"`    // Consecutive error count
+
+	// Real-time estimated usage (from request SSE events)
+	EstimatedInputTokens      int64   `json:"estimatedInputTokens"`       // Cumulative input tokens
+	EstimatedCacheReadTokens  int64   `json:"estimatedCacheReadTokens"`  // Cumulative cache read tokens
+	EstimatedOutputTokens     int64   `json:"estimatedOutputTokens"`     // Cumulative output tokens
+	EstimatedCost             float64 `json:"estimatedCost"`             // Calculated cost in USD
+
+	// Billing API synced usage (actual cost from Fireworks)
+	ActualUsageCost  float64 `json:"actualUsageCost"`  // Actual cost from billing API
+	LastBillingCheck int64   `json:"lastBillingCheck"` // Last sync timestamp
+}
+
+// FireworksConfig represents Fireworks AI provider configuration with multi-key support.
 type FireworksConfig struct {
-	Enabled        bool    `json:"enabled"`                  // Whether Fireworks provider is enabled
-	ApiKey         string  `json:"apiKey,omitempty"`         // Fireworks API key
-	BaseURL        string  `json:"baseUrl,omitempty"`        // Fireworks API base URL
-	AccountID      string  `json:"accountId,omitempty"`      // Fireworks account ID for billing
-	UsageCost      float64 `json:"usageCost,omitempty"`      // Cached usage cost in USD
-	LastUsageCheck int64   `json:"lastUsageCheck,omitempty"` // Last usage check timestamp (Unix seconds)
+	Enabled        bool          `json:"enabled"`        // Whether Fireworks provider is enabled
+	BaseURL        string        `json:"baseUrl"`        // Fireworks API base URL
+	RotationPolicy string        `json:"rotationPolicy"` // "round-robin" or "weighted"
+	CostThreshold  float64       `json:"costThreshold"`  // Auto-stop threshold in USD (default: 5.0)
+	Keys           []FireworksKey `json:"keys"`            // Array of API keys
+
+	// Deprecated fields (kept for reference, not used)
+	ApiKey         string  `json:"apiKey,omitempty"`         // DEPRECATED: Use Keys[].Key
+	AccountID      string  `json:"accountId,omitempty"`      // DEPRECATED: Use Keys[].AccountID
+	UsageCost      float64 `json:"usageCost,omitempty"`      // DEPRECATED: Sum from Keys[].ActualUsageCost
+	LastUsageCheck int64   `json:"lastUsageCheck,omitempty"` // DEPRECATED: Max from Keys[].LastBillingCheck
 }
 
 // Config represents the global application configuration.
@@ -767,31 +802,47 @@ func GetFireworksConfig() FireworksConfig {
 	defer cfgLock.RUnlock()
 	if cfg.Fireworks == nil {
 		return FireworksConfig{
-			Enabled: false,
-			BaseURL: "https://api.fireworks.ai/inference/v1",
+			Enabled:        false,
+			BaseURL:        "https://api.fireworks.ai/inference/v1",
+			RotationPolicy: "round-robin",
+			CostThreshold:  5.0,
+			Keys:           []FireworksKey{},
 		}
 	}
 	result := *cfg.Fireworks
 	if result.BaseURL == "" {
 		result.BaseURL = "https://api.fireworks.ai/inference/v1"
 	}
+	if result.RotationPolicy == "" {
+		result.RotationPolicy = "round-robin"
+	}
+	if result.CostThreshold == 0 {
+		result.CostThreshold = 5.0
+	}
 	return result
 }
 
-// UpdateFireworksConfig updates Fireworks configuration
-func UpdateFireworksConfig(enabled bool, apiKey, baseURL, accountID string) error {
+// UpdateFireworksConfig updates Fireworks configuration (general settings only)
+// For key management, use specific key CRUD functions
+func UpdateFireworksConfig(enabled bool, baseURL, rotationPolicy string, costThreshold float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg.Fireworks == nil {
-		cfg.Fireworks = &FireworksConfig{}
+		cfg.Fireworks = &FireworksConfig{
+			RotationPolicy: "round-robin",
+			CostThreshold:  5.0,
+			Keys:           []FireworksKey{},
+		}
 	}
 	cfg.Fireworks.Enabled = enabled
-	cfg.Fireworks.ApiKey = apiKey
-	cfg.Fireworks.AccountID = accountID
 	if baseURL != "" {
 		cfg.Fireworks.BaseURL = baseURL
-	} else {
-		cfg.Fireworks.BaseURL = "https://api.fireworks.ai/inference/v1"
+	}
+	if rotationPolicy != "" {
+		cfg.Fireworks.RotationPolicy = rotationPolicy
+	}
+	if costThreshold > 0 {
+		cfg.Fireworks.CostThreshold = costThreshold
 	}
 	if err := Save(); err != nil {
 		return err
@@ -800,15 +851,158 @@ func UpdateFireworksConfig(enabled bool, apiKey, baseURL, accountID string) erro
 	return nil
 }
 
-// UpdateFireworksUsage updates cached usage data
-func UpdateFireworksUsage(usageCost float64, timestamp int64) error {
+// UpdateFireworksUsage updates cached usage data for a specific key
+func UpdateFireworksUsage(keyID string, actualCost float64, timestamp int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg.Fireworks == nil {
 		return fmt.Errorf("fireworks config not initialized")
 	}
-	cfg.Fireworks.UsageCost = usageCost
-	cfg.Fireworks.LastUsageCheck = timestamp
+
+	for i, key := range cfg.Fireworks.Keys {
+		if key.ID == keyID {
+			cfg.Fireworks.Keys[i].ActualUsageCost = actualCost
+			cfg.Fireworks.Keys[i].LastBillingCheck = timestamp
+			break
+		}
+	}
+
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
+}
+
+// GetFireworksKeys returns all Fireworks keys
+func GetFireworksKeys() []FireworksKey {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.Fireworks == nil {
+		return []FireworksKey{}
+	}
+	keys := make([]FireworksKey, len(cfg.Fireworks.Keys))
+	copy(keys, cfg.Fireworks.Keys)
+	return keys
+}
+
+// GetFireworksKey returns a specific key by ID
+func GetFireworksKey(keyID string) *FireworksKey {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.Fireworks == nil {
+		return nil
+	}
+	for i := range cfg.Fireworks.Keys {
+		if cfg.Fireworks.Keys[i].ID == keyID {
+			return &cfg.Fireworks.Keys[i]
+		}
+	}
+	return nil
+}
+
+// AddFireworksKey adds a new Fireworks key
+func AddFireworksKey(key FireworksKey) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.Fireworks == nil {
+		cfg.Fireworks = &FireworksConfig{
+			RotationPolicy: "round-robin",
+			CostThreshold:  5.0,
+			Keys:           []FireworksKey{},
+		}
+	}
+	cfg.Fireworks.Keys = append(cfg.Fireworks.Keys, key)
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
+}
+
+// UpdateFireworksKey updates an existing key
+func UpdateFireworksKey(keyID string, key FireworksKey) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.Fireworks == nil {
+		return fmt.Errorf("fireworks config not initialized")
+	}
+	for i, k := range cfg.Fireworks.Keys {
+		if k.ID == keyID {
+			cfg.Fireworks.Keys[i] = key
+			if err := Save(); err != nil {
+				return err
+			}
+			ScheduleGistPush()
+			return nil
+		}
+	}
+	return fmt.Errorf("key not found: %s", keyID)
+}
+
+// DeleteFireworksKey removes a key by ID
+func DeleteFireworksKey(keyID string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.Fireworks == nil {
+		return fmt.Errorf("fireworks config not initialized")
+	}
+	for i, k := range cfg.Fireworks.Keys {
+		if k.ID == keyID {
+			cfg.Fireworks.Keys = append(cfg.Fireworks.Keys[:i], cfg.Fireworks.Keys[i+1:]...)
+			if err := Save(); err != nil {
+				return err
+			}
+			ScheduleGistPush()
+			return nil
+		}
+	}
+	return fmt.Errorf("key not found: %s", keyID)
+}
+
+// UpdateFireworksKeyUsage updates estimated usage for a specific key
+func UpdateFireworksKeyUsage(keyID string, inputTokens, cacheReadTokens, outputTokens int64, estimatedCost float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.Fireworks == nil {
+		return fmt.Errorf("fireworks config not initialized")
+	}
+
+	for i := range cfg.Fireworks.Keys {
+		if cfg.Fireworks.Keys[i].ID == keyID {
+			cfg.Fireworks.Keys[i].EstimatedInputTokens = inputTokens
+			cfg.Fireworks.Keys[i].EstimatedCacheReadTokens = cacheReadTokens
+			cfg.Fireworks.Keys[i].EstimatedOutputTokens = outputTokens
+			cfg.Fireworks.Keys[i].EstimatedCost = estimatedCost
+			break
+		}
+	}
+
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
+}
+
+// UpdateFireworksKeyStatus updates runtime status for a specific key
+func UpdateFireworksKeyStatus(keyID string, isActive bool, cooldownUntil int64, errorCount int, lastUsed int64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.Fireworks == nil {
+		return fmt.Errorf("fireworks config not initialized")
+	}
+
+	for i := range cfg.Fireworks.Keys {
+		if cfg.Fireworks.Keys[i].ID == keyID {
+			cfg.Fireworks.Keys[i].IsActive = isActive
+			cfg.Fireworks.Keys[i].CooldownUntil = cooldownUntil
+			cfg.Fireworks.Keys[i].ErrorCount = errorCount
+			cfg.Fireworks.Keys[i].LastUsed = lastUsed
+			break
+		}
+	}
+
 	if err := Save(); err != nil {
 		return err
 	}
