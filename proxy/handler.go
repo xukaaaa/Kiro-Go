@@ -460,7 +460,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Check if this is a Fireworks model (after mapping)
 	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
-		h.handleFireworksRequest(w, body)
+		// Update request body with mapped model before sending to Fireworks
+		updatedBody, err := json.Marshal(req)
+		if err != nil {
+			h.sendClaudeError(w, 400, "invalid_request_error", "Failed to update request body")
+			return
+		}
+		h.handleFireworksRequest(w, updatedBody)
 		return
 	}
 
@@ -1089,7 +1095,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is a Fireworks model (after mapping)
 	if strings.HasPrefix(req.Model, "accounts/fireworks/models/") {
-		h.handleFireworksRequest(w, body)
+		// Update request body with mapped model before sending to Fireworks
+		updatedBody, err := json.Marshal(req)
+		if err != nil {
+			h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to update request body")
+			return
+		}
+		h.handleFireworksRequest(w, updatedBody)
 		return
 	}
 
