@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"kiro-api-proxy/config"
 	"regexp"
 	"strings"
 	"time"
@@ -46,8 +47,27 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 
 const minimalFallbackUserContent = "."
 
+// maxMappingDepth limits recursion for chain mappings to prevent infinite loops
+const maxMappingDepth = 10
+
 // ParseModelAndThinking 解析模型名称，返回实际模型和是否启用 thinking
+// Priority order:
+// 1. Config ModelMappings (highest priority) - allows runtime overrides
+// 2. Hardcoded custom mappings (model_mapper.go)
+// 3. Ordered fallback mappings (modelMapOrdered)
+// 4. Default fallback: claude-sonnet-4.5
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
+	return parseModelAndThinkingWithDepth(model, thinkingSuffix, 0)
+}
+
+// parseModelAndThinkingWithDepth is the internal implementation with recursion depth tracking
+func parseModelAndThinkingWithDepth(model string, thinkingSuffix string, depth int) (string, bool) {
+	// Prevent infinite recursion from chain mappings
+	if depth > maxMappingDepth {
+		fmt.Printf("[ModelMapping] Warning: max mapping depth exceeded for model=%s\n", model)
+		return model, false
+	}
+
 	lower := strings.ToLower(model)
 	thinking := false
 
@@ -59,24 +79,49 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		lower = strings.ToLower(model)
 	}
 
-	// 优先检查自定义映射（hardcoded custom mappings）
+	// 1. 优先检查配置中的映射（最高优先级）
+	if targetModel, ok := config.GetModelMapping(lower); ok {
+		fmt.Printf("[ModelMapping] Config mapping: %s -> %s\n", lower, targetModel)
+		// For cross-provider routing (Fireworks), return directly without recursive resolution
+		if strings.HasPrefix(strings.ToLower(targetModel), "accounts/fireworks/models/") {
+			return targetModel, thinking
+		}
+		// Recursively resolve the target model (for chain mappings)
+		mappedModel, mappedThinking := parseModelAndThinkingWithDepth(targetModel, thinkingSuffix, depth+1)
+		// Combine thinking flags (if either is thinking, result is thinking)
+		return mappedModel, thinking || mappedThinking
+	}
+
+	// Also check with original case
+	if targetModel, ok := config.GetModelMapping(model); ok {
+		fmt.Printf("[ModelMapping] Config mapping: %s -> %s\n", model, targetModel)
+		// For cross-provider routing (Fireworks), return directly without recursive resolution
+		if strings.HasPrefix(strings.ToLower(targetModel), "accounts/fireworks/models/") {
+			return targetModel, thinking
+		}
+		mappedModel, mappedThinking := parseModelAndThinkingWithDepth(targetModel, thinkingSuffix, depth+1)
+		return mappedModel, thinking || mappedThinking
+	}
+
+	// 2. 检查自定义映射（hardcoded custom mappings）
 	if mappedModel, wasRemapped := MapModelWithCustomMapping(model); wasRemapped {
-		fmt.Printf("[ModelMapping] Original=%s Mapped=%s\n", model, mappedModel)
+		fmt.Printf("[ModelMapping] Hardcoded mapping: Original=%s Mapped=%s\n", model, mappedModel)
 		return mappedModel, thinking
 	}
 
-	// 映射模型（有序匹配，长 key 优先）
+	// 3. 映射模型（有序匹配，长 key 优先）
 	for _, m := range modelMapOrdered {
 		if strings.Contains(lower, m.key) {
 			return m.value, thinking
 		}
 	}
 
-	// 如果已经是有效的 Kiro 模型，直接返回
-	if strings.HasPrefix(lower, "claude-") {
+	// 4. 如果已经是有效的 Kiro 模型或 Fireworks 模型，直接返回
+	if strings.HasPrefix(lower, "claude-") || strings.HasPrefix(lower, "accounts/fireworks/models/") {
 		return model, thinking
 	}
 
+	// Default fallback
 	return "claude-sonnet-4.5", thinking
 }
 

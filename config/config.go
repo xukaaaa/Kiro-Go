@@ -122,6 +122,13 @@ type Config struct {
 	// Endpoint configuration: "auto", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
+	// Model mappings for aliasing and cross-provider routing
+	// Key: source model name (X), Value: target model name (Y)
+	// Examples:
+	//   "gpt-4" -> "claude-sonnet-4.5"  (aliasing)
+	//   "claude-opus" -> "accounts/fireworks/models/llama-v3" (cross-provider routing)
+	ModelMappings map[string]string `json:"modelMappings,omitempty"`
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -237,13 +244,27 @@ func LoadFromURL(url string) error {
 }
 
 // Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
+// Uses atomic write (temp file + rename) to prevent corruption.
 func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+
+	// Write to temp file first, then rename for atomic operation
+	tempPath := cfgPath + ".tmp"
+	if err := os.WriteFile(tempPath, data, 0600); err != nil {
+		return err
+	}
+
+	// Rename is atomic on most filesystems
+	if err := os.Rename(tempPath, cfgPath); err != nil {
+		// Clean up temp file on failure
+		os.Remove(tempPath)
+		return err
+	}
+
+	return nil
 }
 
 // ScheduleGistPush schedules an async push to Gist after config changes
@@ -793,4 +814,124 @@ func UpdateFireworksUsage(usageCost float64, timestamp int64) error {
 	}
 	ScheduleGistPush()
 	return nil
+}
+
+// ==================== Model Mappings ====================
+
+// ModelMappingEntry represents a single model mapping entry with metadata
+type ModelMappingEntry struct {
+	Source      string `json:"source"`
+	Target      string `json:"target"`
+	Description string `json:"description,omitempty"`
+}
+
+// GetModelMappings returns all model mappings
+func GetModelMappings() map[string]string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.ModelMappings == nil {
+		return make(map[string]string)
+	}
+	// Return a copy to avoid race conditions
+	mappings := make(map[string]string, len(cfg.ModelMappings))
+	for k, v := range cfg.ModelMappings {
+		mappings[k] = v
+	}
+	return mappings
+}
+
+// GetModelMappingsList returns model mappings as a list for API responses
+func GetModelMappingsList() []ModelMappingEntry {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.ModelMappings == nil {
+		return []ModelMappingEntry{}
+	}
+	list := make([]ModelMappingEntry, 0, len(cfg.ModelMappings))
+	for source, target := range cfg.ModelMappings {
+		list = append(list, ModelMappingEntry{
+			Source: source,
+			Target: target,
+		})
+	}
+	return list
+}
+
+// GetModelMapping returns the target model for a given source model
+// Returns the target model and true if found, empty string and false otherwise
+func GetModelMapping(source string) (string, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.ModelMappings == nil {
+		return "", false
+	}
+	target, ok := cfg.ModelMappings[source]
+	return target, ok
+}
+
+// SetModelMapping adds or updates a model mapping
+func SetModelMapping(source, target string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.ModelMappings == nil {
+		cfg.ModelMappings = make(map[string]string)
+	}
+	cfg.ModelMappings[source] = target
+	if err := Save(); err != nil {
+		return err
+	}
+	ScheduleGistPush()
+	return nil
+}
+
+// DeleteModelMapping removes a model mapping
+// Returns true if the mapping existed and was deleted, false otherwise
+func DeleteModelMapping(source string) (bool, error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.ModelMappings == nil {
+		return false, nil
+	}
+	if _, exists := cfg.ModelMappings[source]; !exists {
+		return false, nil
+	}
+	delete(cfg.ModelMappings, source)
+	if err := Save(); err != nil {
+		return false, err
+	}
+	ScheduleGistPush()
+	return true, nil
+}
+
+// ==================== Hot Reload ====================
+
+// OnConfigChange is a callback function type for config reload events
+type OnConfigChangeFunc func()
+
+var onConfigChangeCallbacks []OnConfigChangeFunc
+
+// RegisterConfigChangeCallback registers a callback to be called when config changes
+func RegisterConfigChangeCallback(callback OnConfigChangeFunc) {
+	onConfigChangeCallbacks = append(onConfigChangeCallbacks, callback)
+}
+
+// Reload reloads the configuration from disk and notifies all registered callbacks
+func Reload() error {
+	if err := Load(); err != nil {
+		return err
+	}
+
+	// Notify all registered callbacks
+	for _, callback := range onConfigChangeCallbacks {
+		if callback != nil {
+			callback()
+		}
+	}
+
+	return nil
+}
+
+// GetConfigPath returns the current config file path
+func GetConfigPath() string {
+	return cfgPath
 }

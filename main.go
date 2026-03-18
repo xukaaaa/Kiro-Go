@@ -22,7 +22,61 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+
+	"github.com/fsnotify/fsnotify"
 )
+
+// startConfigWatcher starts watching the config file for changes
+// and triggers hot reload when the file is modified
+func startConfigWatcher() {
+	configPath := config.GetConfigPath()
+	if configPath == "" {
+		return
+	}
+
+	// Get the directory to watch (fsnotify watches directories)
+	configDir := filepath.Dir(configPath)
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("Warning: failed to create config watcher: %v", err)
+		return
+	}
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+
+				// Only handle write events for the config file
+				if event.Has(fsnotify.Write) && event.Name == configPath {
+					log.Printf("Config file changed, reloading...")
+					if err := config.Reload(); err != nil {
+						log.Printf("Failed to reload config: %v", err)
+					} else {
+						log.Printf("Config reloaded successfully")
+					}
+				}
+
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Printf("Config watcher error: %v", err)
+			}
+		}
+	}()
+
+	if err := watcher.Add(configDir); err != nil {
+		log.Printf("Warning: failed to watch config directory: %v", err)
+		return
+	}
+
+	log.Printf("Config hot reload enabled, watching: %s", configPath)
+}
 
 func main() {
 	// CONFIG_URL: remote config (GitHub Gist, raw file, etc.)
@@ -58,6 +112,9 @@ func main() {
 
 	// Initialize Gist sync
 	config.SetGistConfig()
+
+	// Start config file watcher for hot reload
+	startConfigWatcher()
 
 	// 初始化账号池
 	pool.GetPool()
