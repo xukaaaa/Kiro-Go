@@ -384,9 +384,8 @@ func (p *FireworksKeyPool) UpdateEstimatedUsage(keyID string, inputTokens, outpu
 	// Get hardcoded pricing
 	inputPrice, cachedInputPrice, outputPrice := getPricing(model)
 
-	// Calculate cost in USD: (non_cached * inputPrice + cached * cachedPrice + output * outputPrice) / 1M
-	nonCachedInput := inputTokens - cacheReadTokens
-	cost := (float64(nonCachedInput)*inputPrice + float64(cacheReadTokens)*cachedInputPrice + float64(outputTokens)*outputPrice) / 1_000_000
+	// Calculate cost in USD: (input * inputPrice + cache * cachedPrice + output * outputPrice) / 1M
+	cost := (float64(inputTokens)*inputPrice + float64(cacheReadTokens)*cachedInputPrice + float64(outputTokens)*outputPrice) / 1_000_000
 
 	for i := range p.keys {
 		if p.keys[i].ID == keyID {

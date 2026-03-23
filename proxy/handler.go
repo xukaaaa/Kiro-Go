@@ -145,20 +145,12 @@ func (h *Handler) refreshAllAccounts() {
 // validateApiKey 验证 API Key
 func (h *Handler) validateApiKey(r *http.Request) bool {
 	if !config.IsApiKeyRequired() {
-		return true // No API key required
-	}
-	return h.getApiKey(r) != ""
-}
-
-// getApiKey 获取已验证的 API Key
-func (h *Handler) getApiKey(r *http.Request) string {
-	if !config.IsApiKeyRequired() {
-		return ""
+		return true
 	}
 
 	expectedKeys := config.GetApiKeys()
 	if len(expectedKeys) == 0 {
-		return ""
+		return true
 	}
 
 	// 从 Authorization 头或 X-Api-Key 头获取
@@ -175,10 +167,10 @@ func (h *Handler) getApiKey(r *http.Request) string {
 	// Check if providedKey matches any key in list
 	for _, key := range expectedKeys {
 		if providedKey == key {
-			return key
+			return true
 		}
 	}
-	return ""
+	return false
 }
 
 // ServeHTTP 路由分发
@@ -475,7 +467,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 			h.sendClaudeError(w, 400, "invalid_request_error", "Failed to update request body")
 			return
 		}
-		h.handleFireworksRequest(w, r, updatedBody, req.Model)
+		h.handleFireworksRequest(w, updatedBody, req.Model)
 		return
 	}
 
@@ -1111,7 +1103,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 			h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to update request body")
 			return
 		}
-		h.handleFireworksRequest(w, r, updatedBody, req.Model)
+		h.handleFireworksRequest(w, updatedBody, req.Model)
 		return
 	}
 
@@ -1601,7 +1593,7 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 
 // ==================== Fireworks Provider ====================
 
-func (h *Handler) handleFireworksRequest(w http.ResponseWriter, r *http.Request, reqBody []byte, model string) {
+func (h *Handler) handleFireworksRequest(w http.ResponseWriter, reqBody []byte, model string) {
 	log.Printf("[Handler] Fireworks request received, body length: %d bytes, model: %s", len(reqBody), model)
 
 	// Parse and log request with truncated text fields
@@ -1708,16 +1700,8 @@ func (h *Handler) handleFireworksRequest(w http.ResponseWriter, r *http.Request,
 	w.Header().Set("Connection", "keep-alive")
 	log.Printf("[Handler] Set streaming headers")
 
-	// Use API key as session ID for prompt caching (Fireworks uses this for session affinity)
-	sessionID := h.getApiKey(r)
-	// Fallback: use fixed session ID when no API key is available
-	if sessionID == "" {
-		sessionID = "no-auth-session"
-	}
-	log.Printf("[Handler] Using API key as session ID for prompt caching: %s", sessionID)
-
 	log.Printf("[Handler] Calling Fireworks API with key %s...", key.ID)
-	err := CallFireworksAPI(key, fwCfg.BaseURL, reqBody, callback, sessionID)
+	err := CallFireworksAPI(key, fwCfg.BaseURL, reqBody, callback)
 	if err != nil {
 		log.Printf("[Handler] Fireworks API call failed: %v", err)
 		// Error already recorded in OnError callback
